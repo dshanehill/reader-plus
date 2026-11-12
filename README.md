@@ -21,7 +21,7 @@ Reader+ is shared freely to help the partially sighted and low-vision community.
 - **Key Echo.** Hear the characters, the words, or both as you type.
 - **Reading window.** Big, high-contrast text, with the word being spoken highlighted. There are five color schemes and adjustable size.
 - **Outline on screen.** The paragraph being read gets a yellow outline on the page itself.
-- **VoiceOver-style controls.** Tap Control to stop talking. Control-Option-P pauses, and Control-Option with = and − makes speech faster or slower.
+- **Stop with Control, just like VoiceOver.** Tap the Control key by itself to stop talking. Control-Option with = and − makes speech faster or slower, and Control-Option-P pauses if you want to pick up where you left off.
 - **Guided tour.** A spoken, step-by-step tour runs the first time you open Reader+. Control-Option-T opens it again.
 
 ## Keyboard shortcuts
@@ -35,8 +35,8 @@ All shortcuts use **Control + Option** (⌃⌥), like VoiceOver.
 | ⌃⌥ R | Read from the cursor, or the whole page |
 | ⌃⌥ V | Read the clipboard |
 | ⌃⌥ O | Read the words in the window under the pointer (OCR) |
+| Tap ⌃ Control | Stop talking, like VoiceOver |
 | ⌃⌥ P | Pause or resume |
-| Tap ⌃ | Stop talking (also ⌃⌥ X) |
 | ⌃⌥ = and ⌃⌥ − | Faster and slower |
 | ⌃⌥ → and ⌃⌥ ← | Next and previous paragraph |
 | ⌃⌥ ↓ and ⌃⌥ ↑ | Next and previous heading |
@@ -65,7 +65,7 @@ macOS keeps apps from seeing other apps unless you allow it. Reader+ asks for:
 | Permission | Why |
 |---|---|
 | **Accessibility** | To see the words in Safari, Chrome, Mail and your other apps. Without it, Reader+ can only read the clipboard. |
-| **Input Monitoring** | So Key Echo can hear what you type, and a tap of Control can stop speech. |
+| **Input Monitoring** | So Key Echo can hear what you type. |
 | **Screen Recording** | To read the words in pictures and scanned pages. |
 
 Turn them on in **System Settings → Privacy & Security**. Reader+'s **Permissions** pane has a button for each one. After turning on Input Monitoring or Screen Recording, quit and reopen Reader+.
