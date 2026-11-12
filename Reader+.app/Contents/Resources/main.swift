@@ -22,6 +22,7 @@ import ServiceManagement
 import SwiftUI
 import Vision
 import ScreenCaptureKit
+import Security
 
 // MARK: - Log & settings
 
@@ -75,9 +76,116 @@ extension String { var trimmed: String { trimmingCharacters(in: .whitespacesAndN
 
 // MARK: - Speech (system voices — the same ones VoiceOver uses)
 
+// MARK: - ElevenLabs voices (optional; uses your own ElevenLabs API key)
+
+/// The API key lives in the macOS Keychain, not in a settings file.
+enum Keychain {
+    static let service = "Reader+ ElevenLabs", account = "api-key"
+    static func get() -> String? {
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+                                kSecAttrAccount as String: account, kSecReturnData as String: true,
+                                kSecMatchLimit as String: kSecMatchLimitOne]
+        var out: CFTypeRef?
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let d = out as? Data else { return nil }
+        let k = String(data: d, encoding: .utf8)?.trimmed ?? ""
+        return k.isEmpty ? nil : k
+    }
+    static func set(_ key: String) {
+        delete()
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+                                kSecAttrAccount as String: account, kSecValueData as String: Data(key.trimmed.utf8)]
+        SecItemAdd(q as CFDictionary, nil)
+    }
+    static func delete() {
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+                                kSecAttrAccount as String: account]
+        SecItemDelete(q as CFDictionary)
+    }
+}
+
+struct ElevenWord { let loc: Int; let len: Int; let start: Double }
+
+final class Eleven {
+    static let shared = Eleven()
+    static let prefix = "eleven:"
+    let base = "https://api.elevenlabs.io"
+    var hasKey: Bool { Keychain.get() != nil }
+    /// "eleven_flash_v2_5" is quick to start; "eleven_multilingual_v2" is the richest quality.
+    var model: String { prefs.string(forKey: "elevenModel") ?? "eleven_flash_v2_5" }
+    /// The voices on your ElevenLabs account, saved after "Load My Voices": [[id, name]].
+    var voices: [(id: String, name: String)] {
+        ((prefs.array(forKey: "elevenVoices") as? [[String]]) ?? []).compactMap { $0.count == 2 ? ($0[0], $0[1]) : nil }
+    }
+    /// Reader+ speed (0.1–1.0, 0.5 normal) as ElevenLabs speed (0.7–1.2, 1.0 normal).
+    var speed: Double { max(0.7, min(1.2, 1.0 + (prefs.double(forKey: Key.rate) - 0.5) * 1.33)) }
+
+    func loadVoices(_ done: @escaping (String?) -> Void) {
+        guard let key = Keychain.get() else { done("Add your ElevenLabs API key first."); return }
+        var r = URLRequest(url: URL(string: base + "/v1/voices")!)
+        r.setValue(key, forHTTPHeaderField: "xi-api-key")
+        r.timeoutInterval = 20
+        URLSession.shared.dataTask(with: r) { data, resp, err in
+            var message: String? = nil
+            if let err = err { message = "Couldn't reach ElevenLabs: \(err.localizedDescription)" }
+            else if let h = resp as? HTTPURLResponse, h.statusCode != 200 {
+                message = h.statusCode == 401 ? "ElevenLabs didn't accept that API key." : "ElevenLabs answered with error \(h.statusCode)."
+            } else if let d = data, let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                      let list = j["voices"] as? [[String: Any]] {
+                let v = list.compactMap { x -> [String]? in
+                    guard let id = x["voice_id"] as? String, let n = x["name"] as? String else { return nil }
+                    return [id, n]
+                }.sorted { $0[1].lowercased() < $1[1].lowercased() }
+                prefs.set(v, forKey: "elevenVoices")
+                log("ElevenLabs: \(v.count) voices loaded")
+            } else { message = "ElevenLabs sent something Reader+ couldn't read." }
+            DispatchQueue.main.async { done(message) }
+        }.resume()
+    }
+
+    /// Turns text into speech. Returns the audio and when each word starts (for highlighting).
+    func speech(_ text: String, voice: String, _ done: @escaping (Data?, [ElevenWord], String?) -> Void) {
+        guard let key = Keychain.get() else { done(nil, [], "no ElevenLabs key"); return }
+        var c = URLComponents(string: base + "/v1/text-to-speech/\(voice)/with-timestamps")!
+        c.queryItems = [URLQueryItem(name: "output_format", value: "mp3_44100_128")]
+        var r = URLRequest(url: c.url!)
+        r.httpMethod = "POST"
+        r.timeoutInterval = 30
+        r.setValue(key, forHTTPHeaderField: "xi-api-key")
+        r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: Any] = ["text": text, "model_id": model,
+                                   "voice_settings": ["stability": 0.5, "similarity_boost": 0.75, "speed": speed]]
+        r.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        URLSession.shared.dataTask(with: r) { data, resp, err in
+            if let err = err { done(nil, [], err.localizedDescription); return }
+            if let h = resp as? HTTPURLResponse, h.statusCode != 200 {
+                let detail = data.flatMap { String(data: $0, encoding: .utf8) }?.prefix(200) ?? ""
+                done(nil, [], "HTTP \(h.statusCode) \(detail)"); return
+            }
+            guard let d = data, let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                  let b64 = j["audio_base64"] as? String, let audio = Data(base64Encoded: b64) else {
+                done(nil, [], "unreadable answer"); return
+            }
+            var words: [ElevenWord] = []
+            if let al = j["alignment"] as? [String: Any], let chars = al["characters"] as? [String],
+               let starts = al["character_start_times_seconds"] as? [Double], starts.count == chars.count {
+                var loc = 0, wStart = -1, wTime = 0.0
+                for (i, ch) in chars.enumerated() {
+                    let isSpace = ch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    if isSpace {
+                        if wStart >= 0 { words.append(ElevenWord(loc: wStart, len: loc - wStart, start: wTime)); wStart = -1 }
+                    } else if wStart < 0 { wStart = loc; wTime = starts[i] }
+                    loc += (ch as NSString).length
+                }
+                if wStart >= 0 { words.append(ElevenWord(loc: wStart, len: loc - wStart, start: wTime)) }
+            }
+            done(audio, words, nil)
+        }.resume()
+    }
+}
+
 /// Speaks with either a voice picked in Reader+ (AVSpeechSynthesizer), or the Mac's System Voice
 /// from System Settings > Accessibility > Spoken Content, which can be a Siri voice (NSSpeechSynthesizer).
-final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerDelegate {
+final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerDelegate, AVAudioPlayerDelegate {
     static let shared = Speaker()
     let synth = AVSpeechSynthesizer()
     private var sys = NSSpeechSynthesizer()
@@ -87,6 +195,19 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
     private var sysOffset = 0
     private var sysReading = false
     private var sysPaused = false
+    // ElevenLabs
+    private var elQueue: [(Int, String)] = []
+    private var elAll: [(Int, String)] = []
+    private var elReading = false
+    private var elPaused = false
+    private var elGen = 0
+    private var elPlayer: AVAudioPlayer?
+    private var elTimer: Timer?
+    private var elWords: [ElevenWord] = []
+    private var elOffset = 0
+    private var elLastWord = -1
+    private var elCache: [Int: (Data?, [ElevenWord], String?)] = [:]
+    private var elWaiting: [Int: (Data?, [ElevenWord], String?) -> Void] = [:]
     var onWord: ((NSRange) -> Void)?
     var onDone: (() -> Void)?
 
@@ -94,13 +215,20 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
 
     /// "Siri / System Voice" is chosen (no Reader+ voice picked).
     var useSystemVoice: Bool { (prefs.string(forKey: Key.voice) ?? "").isEmpty }
-    var isReading: Bool { lastPiece != nil || sysReading }
-    var isPaused: Bool { synth.isPaused || sysPaused }
-    var isSpeaking: Bool { synth.isSpeaking || sys.isSpeaking }
+    /// The ElevenLabs voice ID, when an ElevenLabs voice is chosen and a key is saved.
+    var elevenVoice: String? {
+        guard let v = prefs.string(forKey: Key.voice), v.hasPrefix(Eleven.prefix), Eleven.shared.hasKey else { return nil }
+        return String(v.dropFirst(Eleven.prefix.count))
+    }
+    var isReading: Bool { lastPiece != nil || sysReading || elReading }
+    var isPaused: Bool { synth.isPaused || sysPaused || elPaused }
+    var isSpeaking: Bool { synth.isSpeaking || sys.isSpeaking || (elPlayer?.isPlaying ?? false) }
 
     var voice: AVSpeechSynthesisVoice? {
         if let id = prefs.string(forKey: Key.voice), let v = AVSpeechSynthesisVoice(identifier: id) { return v }
-        return AVSpeechSynthesisVoice(language: AVSpeechSynthesisVoice.currentLanguageCode())
+        // With an ElevenLabs voice, short announcements use the best Apple voice installed.
+        let best = readingVoices().filter { $0.language.hasPrefix("en") }.max { $0.quality.rawValue < $1.quality.rawValue }
+        return best ?? AVSpeechSynthesisVoice(language: AVSpeechSynthesisVoice.currentLanguageCode())
     }
 
     /// Reader+'s speed (0.1–1.0, 0.5 is normal) in words per minute, for the System Voice.
@@ -129,6 +257,9 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
     private func halt() {
         offsets = [:]; lastPiece = nil
         sysQueue = []; sysReading = false; sysPaused = false
+        elGen += 1; elQueue = []; elAll = []; elReading = false; elPaused = false
+        elCache = [:]; elWaiting = [:]; elTimer?.invalidate(); elTimer = nil
+        elPlayer?.stop(); elPlayer = nil
         if synth.isSpeaking || synth.isPaused { synth.stopSpeaking(at: .immediate) }
         if sys.isSpeaking { sys.stopSpeaking() }
     }
@@ -139,6 +270,12 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
         let wasReading = isReading
         halt()
         if !track && wasReading { onDone?() }
+        if track, let ev = elevenVoice {
+            elAll = Speaker.pieces(text); elQueue = elAll
+            elReading = true
+            nextElevenPiece(ev, elGen)
+            return
+        }
         if useSystemVoice {
             let s = NSSpeechSynthesizer()   // a fresh one, so a newly chosen System Voice is used
             s.delegate = self
@@ -155,7 +292,13 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
             let u = AVSpeechUtterance(string: text.trimmed); u.rate = rate; u.voice = v
             synth.speak(u); return
         }
-        for (off, piece) in Speaker.pieces(text) {
+        speakApple(Speaker.pieces(text))
+    }
+
+    /// Reads pieces with an Apple voice (also used if ElevenLabs can't be reached).
+    private func speakApple(_ list: [(Int, String)]) {
+        let rate = Float(prefs.double(forKey: Key.rate)), v = voice
+        for (off, piece) in list {
             let u = AVSpeechUtterance(string: piece); u.rate = rate; u.voice = v
             offsets[ObjectIdentifier(u)] = off
             lastPiece = u
@@ -171,7 +314,69 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
         if !sys.startSpeaking(text) { sysReading = false; onDone?() }
     }
 
+    private func fetchEleven(_ off: Int, _ text: String, _ voiceID: String, _ gen: Int) {
+        guard elCache[off] == nil else { return }
+        elCache[off] = (nil, [], "pending")
+        Eleven.shared.speech(text, voice: voiceID) { audio, words, err in
+            DispatchQueue.main.async {
+                guard gen == self.elGen else { return }
+                let r = (audio, words, err)
+                self.elCache[off] = r
+                if let w = self.elWaiting.removeValue(forKey: off) { w(audio, words, err) }
+            }
+        }
+    }
+
+    private func nextElevenPiece(_ voiceID: String, _ gen: Int) {
+        guard gen == elGen, elReading else { return }
+        guard !elQueue.isEmpty else { elReading = false; onDone?(); return }
+        let (off, text) = elQueue.removeFirst()
+        let play: (Data?, [ElevenWord], String?) -> Void = { audio, words, err in
+            guard gen == self.elGen, self.elReading else { return }
+            guard let a = audio, let player = try? AVAudioPlayer(data: a) else {
+                // ElevenLabs couldn't be reached: carry on with an Apple voice from here.
+                log("ElevenLabs failed (\(err ?? "no audio")); using an Apple voice")
+                let rest = [(off, text)] + self.elQueue
+                self.elReading = false; self.elQueue = []
+                self.speakApple(rest)
+                return
+            }
+            self.elPlayer = player; player.delegate = self
+            self.elWords = words; self.elOffset = off; self.elLastWord = -1
+            player.prepareToPlay(); player.play()
+            self.elTimer?.invalidate()
+            self.elTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in self.elevenTick() }
+            // Get the next piece ready while this one plays, so there's no gap.
+            if let next = self.elQueue.first { self.fetchEleven(next.0, next.1, voiceID, gen) }
+        }
+        if let c = elCache[off], c.2 != "pending" { play(c.0, c.1, c.2) }
+        else { elWaiting[off] = play; fetchEleven(off, text, voiceID, gen) }
+    }
+
+    private func elevenTick() {
+        guard let p = elPlayer, !elWords.isEmpty else { return }
+        let t = p.currentTime
+        var i = elLastWord
+        while i + 1 < elWords.count && elWords[i + 1].start <= t { i += 1 }
+        if i != elLastWord && i >= 0 {
+            elLastWord = i
+            onWord?(NSRange(location: elOffset + elWords[i].loc, length: elWords[i].len))
+        }
+    }
+
+    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        DispatchQueue.main.async {
+            guard player === self.elPlayer, self.elReading, let v = self.elevenVoice else { return }
+            self.elTimer?.invalidate()
+            self.nextElevenPiece(v, self.elGen)
+        }
+    }
+
     func pauseOrResume() {
+        if elReading {
+            if elPaused { elPlayer?.play(); elPaused = false } else { elPlayer?.pause(); elPaused = true }
+            return
+        }
         if sysReading || sys.isSpeaking || sysPaused {
             if sysPaused { sys.continueSpeaking(); sysPaused = false }
             else { sys.pauseSpeaking(at: .wordBoundary); sysPaused = true }
@@ -221,6 +426,8 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
 }
 
 func say(_ s: String) { Speaker.shared.say(s) }
+/// A voice sample: spoken with the chosen reading voice (ElevenLabs too).
+func sample(_ s: String) { Speaker.shared.say(s, track: true) }
 
 // MARK: - Accessibility helpers
 
@@ -2048,6 +2255,17 @@ struct EchoPane: View {
 
 struct VoicePane: View {
     @ObservedObject var model = ReaderModel.shared
+    @State private var keyField = ""
+    @State private var elStatus = ""
+    @State private var busy = false
+    func loadVoices() {
+        busy = true; elStatus = "Loading your ElevenLabs voices…"
+        Eleven.shared.loadVoices { err in
+            busy = false
+            elStatus = err ?? "Loaded \(Eleven.shared.voices.count) voices. Pick one in the Voice menu above."
+            model.changed()
+        }
+    }
     func title(_ v: AVSpeechSynthesisVoice) -> String {
         v.name + (v.quality == .premium ? " (Premium)" : (v.quality == .enhanced ? " (Enhanced)" : ""))
     }
@@ -2060,9 +2278,13 @@ struct VoicePane: View {
                     set: { v in
                         if v.isEmpty { prefs.removeObject(forKey: Key.voice) } else { prefs.set(v, forKey: Key.voice) }
                         model.changed()
-                        if Speaker.shared.isReading { Reading.shared.restartHere() } else { say("This is my voice.") }
+                        if Speaker.shared.isReading { Reading.shared.restartHere() } else { sample("This is my voice.") }
                     })) {
                     Text("Siri / System Voice").tag("")
+                    if Eleven.shared.hasKey && !Eleven.shared.voices.isEmpty {
+                        Divider()
+                        ForEach(Eleven.shared.voices, id: \.id) { v in Text("\(v.name) (ElevenLabs)").tag(Eleven.prefix + v.id) }
+                    }
                     Divider()
                     ForEach(readingVoices(), id: \.identifier) { v in Text(title(v)).tag(v.identifier) }
                 }
@@ -2073,7 +2295,7 @@ struct VoicePane: View {
                                               set: { prefs.set(($0 * 20).rounded() / 20, forKey: Key.rate); model.changed() }),
                                in: 0.1...1.0,
                                onEditingChanged: { editing in
-                                   if !editing { if Speaker.shared.isReading { Reading.shared.restartHere() } else { say("This is my speed.") } }
+                                   if !editing { if Speaker.shared.isReading { Reading.shared.restartHere() } else { sample("This is my speed.") } }
                                })
                         Image(systemName: "hare.fill").foregroundStyle(.secondary)
                         Text("\(Int((rate * 100).rounded()))%").monospacedDigit().frame(width: 44, alignment: .trailing)
@@ -2082,11 +2304,47 @@ struct VoicePane: View {
                 }
                 HStack {
                     Spacer()
-                    Button("Test Voice") { say("Hello. This is how Reader plus sounds.") }
+                    Button("Test Voice") { sample("Hello. This is how Reader plus sounds.") }
                     Button("Choose Siri Voice…") { appDel.moreVoices() }
                 }
             } footer: {
                 Text("Siri / System Voice speaks with the voice chosen in System Settings, Accessibility, Spoken Content. Pick a Siri voice there and Reader+ uses it. The other voices are the ones VoiceOver uses; Enhanced and Premium sound the most natural.")
+                    .foregroundStyle(.secondary)
+            }
+            Section {
+                if Eleven.shared.hasKey {
+                    LabeledContent("API key") {
+                        HStack { Label("Saved in your Keychain", systemImage: "checkmark.seal.fill").foregroundStyle(.green)
+                                 Button("Remove") { Keychain.delete(); prefs.removeObject(forKey: "elevenVoices")
+                                     if (prefs.string(forKey: Key.voice) ?? "").hasPrefix(Eleven.prefix) { prefs.removeObject(forKey: Key.voice) }
+                                     elStatus = "Key removed."; model.changed() } }
+                    }
+                    LabeledContent("Your voices") {
+                        Button(busy ? "Loading…" : "Load My Voices") { loadVoices() }.disabled(busy)
+                    }
+                    Picker("Quality", selection: Binding<String>(
+                        get: { Eleven.shared.model },
+                        set: { prefs.set($0, forKey: "elevenModel"); model.changed() })) {
+                        Text("Fast (starts quickly, uses fewer credits)").tag("eleven_flash_v2_5")
+                        Text("Best (richest voice, slower to start)").tag("eleven_multilingual_v2")
+                    }
+                } else {
+                    LabeledContent("API key") {
+                        HStack {
+                            SecureField("Paste your ElevenLabs API key", text: $keyField).frame(maxWidth: 260)
+                            Button("Save") {
+                                guard !keyField.trimmed.isEmpty else { return }
+                                Keychain.set(keyField); keyField = ""; model.changed(); loadVoices()
+                            }
+                        }
+                    }
+                    LabeledContent("Get a key") {
+                        Button("Open ElevenLabs…") { NSWorkspace.shared.open(URL(string: "https://elevenlabs.io/app/settings/api-keys")!) }
+                    }
+                }
+                if !elStatus.isEmpty { Text(elStatus).foregroundStyle(.secondary) }
+            } header: { Text("ElevenLabs Voices") } footer: {
+                Text("Optional. ElevenLabs voices sound like real people. When one is chosen, the text Reader+ reads is sent to ElevenLabs to make the voice, and it uses your ElevenLabs credits. If ElevenLabs can't be reached, Reader+ carries on with an Apple voice.")
                     .foregroundStyle(.secondary)
             }
         }
@@ -2435,6 +2693,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let sys = NSMenuItem(title: "Siri / System Voice", action: #selector(pickVoice(_:)), keyEquivalent: "")
         sys.target = self; sys.representedObject = ""; sys.state = current == nil ? .on : .off
         vm.addItem(sys); vm.addItem(.separator())
+        if Eleven.shared.hasKey && !Eleven.shared.voices.isEmpty {
+            for ev in Eleven.shared.voices {
+                let ei = NSMenuItem(title: "\(ev.name) (ElevenLabs)", action: #selector(pickVoice(_:)), keyEquivalent: "")
+                ei.target = self; ei.representedObject = Eleven.prefix + ev.id; ei.state = current == Eleven.prefix + ev.id ? .on : .off
+                vm.addItem(ei)
+            }
+            vm.addItem(.separator())
+        }
         for v in voices {
             let q = v.quality == .premium ? " (Premium)" : (v.quality == .enhanced ? " (Enhanced)" : "")
             let vi = NSMenuItem(title: "\(v.name)\(q) — \(v.language)", action: #selector(pickVoice(_:)), keyEquivalent: "")
@@ -2478,7 +2744,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func pickVoice(_ s: NSMenuItem) {
         guard let id = s.representedObject as? String else { return }
         if id.isEmpty { prefs.removeObject(forKey: Key.voice) } else { prefs.set(id, forKey: Key.voice) }
-        if Speaker.shared.isReading { Reading.shared.restartHere() } else { say("This is my voice.") }
+        if Speaker.shared.isReading { Reading.shared.restartHere() } else { sample("This is my voice.") }
     }
     @objc func moreVoices() {
         say("To use Siri, open System Voice here and pick a Siri voice. Reader plus uses it when Siri, System Voice is chosen. Manage Voices adds more.")
