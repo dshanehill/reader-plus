@@ -14,11 +14,11 @@ Reader+ is shared freely to help the partially sighted and low-vision community.
 
 Reader+ is made for the mouse. There's no list of keyboard shortcuts to learn: you hold **Command** and use your mouse. If you want lots of keyboard commands, that's what VoiceOver is for.
 
-- **⌘-click to read by headings and paragraphs.** Click a heading to hear it and everything under it, up to the next heading. Click a paragraph to hear the article from there, or just that paragraph if you prefer.
+- **⌘-click to read by headings and paragraphs.** Click a heading to hear it and everything under it, up to the next heading. Click a paragraph to hear everything from there to the end without stopping, or just that paragraph if you prefer. It works in AI chat apps too (Claude, ChatGPT and others), so you can hear a whole reply even when the app has no read-aloud button.
 - **Whole posts on social media.** On Facebook, Instagram, X, Threads, LinkedIn, Reddit and similar sites, ⌘-click a post. Reader+ presses *See more* for you and reads the entire post. It skips the Like, Comment and Share buttons.
 - **Words in pictures (OCR).** ⌘-click a screenshot, meme or scanned page to hear the words in it. It uses the Mac's built-in text recognition, so nothing leaves your computer.
 - **Read a whole page.** ⌘-right-click anywhere on a page or window to hear all of it from the top. If it has no real text, Reader+ reads the words it sees on screen.
-- **Pause, move and change speed with the mouse.** While Reader+ is talking, ⌘-right-click pauses and resumes, ⌘ with your mouse's Back and Forward side buttons moves by paragraph, and ⌘ with the scroll wheel makes speech faster (up) or slower (down).
+- **Stop, move and change speed with the mouse.** While Reader+ is talking, ⌘-right-click stops it, ⌘ with your mouse's Back and Forward side buttons moves by paragraph, and ⌘ with the scroll wheel makes speech faster (up) or slower (down).
 - **Stop with Control, just like VoiceOver.** Tap the Control key by itself to stop talking.
 - **Mouse Echo.** Rest the pointer on a button, menu, link or line of text to hear it, for example "Save, button".
 - **Key Echo.** Hear the characters, the words, or both as you type.
@@ -32,9 +32,9 @@ Mouse Echo, Key Echo, the reading window, voices, reading selected text or the c
 
 | Do this | What happens |
 |---|---|
-| ⌘-click | Read a heading and its section, a paragraph onward, a whole social media post, or the words in a picture |
+| ⌘-click | Read a heading and its section, everything from a paragraph onward (also in AI chat apps), a whole social media post, or the words in a picture |
 | ⌘-right-click | Read the whole page or window |
-| ⌘-right-click while reading | Pause or resume |
+| ⌘-right-click while reading | Stop talking |
 | ⌘ + mouse Back / Forward button | Previous / next paragraph |
 | ⌘ + scroll up / down | Faster / slower |
 | Tap ⌃ Control | Stop talking, like VoiceOver |
