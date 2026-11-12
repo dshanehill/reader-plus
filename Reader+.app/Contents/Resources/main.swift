@@ -199,7 +199,7 @@ for c in /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 /opt/homebrew
          /Library/Frameworks/Python.framework/Versions/3.1[0-3]/bin/python3 \
          /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
   [ -x "$c" ] || continue
-  if "$c" -c 'import sys; sys.exit(0 if (3,10) <= sys.version_info[:2] < (3,14) else 1)' 2>/dev/null; then PY="$c"; break; fi
+  if "$c" -c "import sys, platform; sys.exit(0 if (3,10) <= sys.version_info[:2] < (3,14) and platform.machine() == '$(uname -m)' else 1)" 2>/dev/null; then PY="$c"; break; fi
 done
 rm -rf "$D/venv"
 if [ -n "$PY" ]; then
@@ -219,6 +219,7 @@ else
   "$D/uv/uv" pip install --python "$D/venv/bin/python" kokoro-onnx numpy
 fi
 step "Downloading the voices (about 330 MB)"
+"$D/venv/bin/python" -c "import platform, sys; print('Python', sys.version.split()[0], platform.machine())"
 for f in kokoro-v1.0.onnx voices-v1.0.bin; do
   if [ ! -s "$f" ]; then
     curl -fL --retry 3 -o "$f.part" "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/$f" \
@@ -239,14 +240,47 @@ step "Done"
 
 let kokoroServerScript = #"""
 # Reader+ Kokoro voice server. Listens only on this Mac (127.0.0.1).
-import sys, json, io, wave, threading
+import sys, json, io, wave, threading, time
 import numpy as np
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from kokoro_onnx import Kokoro
 
 d, port = sys.argv[1], int(sys.argv[2])
 k = Kokoro(f"{d}/kokoro-v1.0.onnx", f"{d}/voices-v1.0.bin")
+
+# Speed-up: the pronunciation step normally restarts espeak for every request (~0.8 s).
+# Keep one espeak running per language instead.
+try:
+    import phonemizer as _ph
+    from phonemizer.backend import EspeakBackend
+    from phonemizer.separator import default_separator
+    _orig, _cache = _ph.phonemize, {}
+    def _fast(text, language="en-us", backend="espeak", separator=None, strip=False, preserve_punctuation=False,
+              with_stress=False, tie=False, language_switch="keep-flags", words_mismatch="ignore", **kw):
+        try:
+            key = (language, preserve_punctuation, with_stress, tie, language_switch, words_mismatch)
+            b = _cache.get(key)
+            if b is None:
+                b = _cache[key] = EspeakBackend(language, preserve_punctuation=preserve_punctuation, with_stress=with_stress,
+                                                tie=tie, language_switch=language_switch, words_mismatch=words_mismatch)
+            single = isinstance(text, str)
+            out = b.phonemize([text] if single else list(text),
+                              separator=separator if separator is not None else default_separator, strip=strip)
+            return out[0] if single else out
+        except Exception:
+            return _orig(text, language=language, backend=backend, separator=separator, strip=strip,
+                         preserve_punctuation=preserve_punctuation, with_stress=with_stress, tie=tie,
+                         language_switch=language_switch, words_mismatch=words_mismatch, **kw)
+    _ph.phonemize = _fast
+    import kokoro_onnx.tokenizer as _tk
+    if hasattr(_tk, "phonemize"): _tk.phonemize = _fast
+    if hasattr(_tk, "phonemizer"): _tk.phonemizer.phonemize = _fast
+except Exception as e:
+    print("phonemizer speed-up not applied:", e, file=sys.stderr)
+try: k.create("Hi.", voice="af_heart", speed=1.0, lang="en-us")
+except Exception: pass
 lock = threading.Lock()
+latest = [0]   # the newest reading; older queued pieces are skipped so a new click never waits behind them
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -254,10 +288,37 @@ class H(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", kind)
         self.send_header("Content-Length", str(len(body)))
+        if getattr(self, "timing", None) is not None: self.send_header("X-Synth-Seconds", "%.2f" % self.timing)
         self.end_headers()
         self.wfile.write(body)
     def do_GET(self):
         if self.path == "/ping": self.reply(200, b"ok", "text/plain")
+        elif self.path == "/bench":
+            out = {}
+            try:
+                import os, onnxruntime as ort
+                t = "Hello there, this is a test."
+                t0 = time.time(); ph = k.tokenizer.phonemize(t, "en-us"); out["phonemize"] = round(time.time() - t0, 3)
+                t0 = time.time(); k.tokenizer.phonemize("Something new to say.", "en-us"); out["phonemize_new_text"] = round(time.time() - t0, 3)
+                with lock:
+                    t0 = time.time(); k.create(t, voice="af_heart", speed=1.0, lang="en-us"); out["create_default"] = round(time.time() - t0, 3)
+                out["providers"] = ort.get_available_providers()
+                out["cpus"] = os.cpu_count()
+                for th in (4, 6):
+                    so = ort.SessionOptions(); so.intra_op_num_threads = th
+                    sess = ort.InferenceSession(f"{d}/kokoro-v1.0.onnx", so, providers=["CPUExecutionProvider"])
+                    k2 = Kokoro.from_session(sess, f"{d}/voices-v1.0.bin")
+                    k2.create(t, voice="af_heart", speed=1.0, lang="en-us")
+                    t0 = time.time(); k2.create(t, voice="af_heart", speed=1.0, lang="en-us"); out[f"threads{th}"] = round(time.time() - t0, 3)
+                if "CoreMLExecutionProvider" in ort.get_available_providers():
+                    try:
+                        sess = ort.InferenceSession(f"{d}/kokoro-v1.0.onnx", providers=["CoreMLExecutionProvider", "CPUExecutionProvider"])
+                        k3 = Kokoro.from_session(sess, f"{d}/voices-v1.0.bin")
+                        k3.create(t, voice="af_heart", speed=1.0, lang="en-us")
+                        t0 = time.time(); k3.create(t, voice="af_heart", speed=1.0, lang="en-us"); out["coreml"] = round(time.time() - t0, 3)
+                    except Exception as e: out["coreml_error"] = str(e)[:200]
+            except Exception as e: out["error"] = str(e)[:300]
+            self.reply(200, json.dumps(out).encode(), "application/json")
         elif self.path == "/voices":
             try: v = sorted(k.get_voices())
             except Exception: v = []
@@ -269,12 +330,17 @@ class H(BaseHTTPRequestHandler):
             req = json.loads(self.rfile.read(n) or b"{}")
             text = (req.get("text") or "").strip()
             if not text: return self.reply(400, b"no text", "text/plain")
+            gen = int(req.get("gen", 0))
+            if gen > latest[0]: latest[0] = gen
             with lock:
+                if gen and gen < latest[0]: return self.reply(409, b"replaced", "text/plain")
+                t0 = time.time()
                 samples, sr = k.create(text, voice=req.get("voice", "af_heart"),
                                        speed=float(req.get("speed", 1.0)), lang=req.get("lang", "en-us"))
             pcm = (np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes()
             buf = io.BytesIO()
             w = wave.open(buf, "wb"); w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr); w.writeframes(pcm); w.close()
+            self.timing = time.time() - t0
             self.reply(200, buf.getvalue(), "audio/wav")
         except Exception as e:
             self.reply(500, str(e).encode(), "text/plain")
@@ -378,18 +444,62 @@ final class Kokoro {
         return false
     }
 
-    func warmUp() { guard isInstalled else { return }; DispatchQueue.global(qos: .utility).async { _ = self.ensureServer() } }
+    func warmUp() {
+        guard isInstalled else { return }
+        DispatchQueue.global(qos: .utility).async {
+            if self.needsNativeReinstall() {
+                DispatchQueue.main.async {
+                    self.stopServer()
+                    self.install({ _ in }) { ok in log("Kokoro native reinstall " + (ok ? "done" : "failed")); if ok { self.warmUp() } }
+                }
+                return
+            }
+            if self.ensureServer() && !prefs.bool(forKey: "kokoroBenched2") {
+                prefs.set(true, forKey: "kokoroBenched2")
+                var r = URLRequest(url: URL(string: "http://127.0.0.1:\(self.port)/bench")!); r.timeoutInterval = 180
+                URLSession.shared.dataTask(with: r) { d, _, _ in
+                    log("Kokoro speed test: " + (d.flatMap { String(data: $0, encoding: .utf8) } ?? "no answer"))
+                }.resume()
+            }
+        }
+    }
+
+    private var checkedNative = false
+    /// True when Kokoro's Python runs through Intel translation on an Apple Silicon Mac (much slower).
+    private func needsNativeReinstall() -> Bool {
+        if checkedNative { return false }
+        checkedNative = true
+        let p = Process(); let out = Pipe()
+        p.executableURL = dir.appendingPathComponent("venv/bin/python")
+        p.arguments = ["-c", "import platform, sys; print(platform.machine(), sys.version.split()[0])"]
+        p.standardOutput = out; p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return false }
+        p.waitUntilExit()
+        let info = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?.trimmed ?? "?"
+        #if arch(arm64)
+        let mine = "arm64"
+        #else
+        let mine = "x86_64"
+        #endif
+        log("Kokoro Python: \(info); Reader+: \(mine)")
+        return !info.hasPrefix(mine)
+    }
     func stopServer() { server?.terminate(); server = nil; ready = false }
 
-    func speech(_ text: String, voice: String, _ done: @escaping (Data?, [ElevenWord], String?) -> Void) {
+    func speech(_ text: String, voice: String, gen: Int = 0, _ done: @escaping (Data?, [ElevenWord], String?) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             guard self.ensureServer() else { done(nil, [], "Kokoro didn't start"); return }
             var r = URLRequest(url: URL(string: "http://127.0.0.1:\(self.port)/speak")!)
             r.httpMethod = "POST"; r.timeoutInterval = 90
             r.setValue("application/json", forHTTPHeaderField: "Content-Type")
             let lang = voice.hasPrefix("b") ? "en-gb" : "en-us"
-            r.httpBody = try? JSONSerialization.data(withJSONObject: ["text": text, "voice": voice, "speed": self.speed, "lang": lang])
+            r.httpBody = try? JSONSerialization.data(withJSONObject: ["text": text, "voice": voice, "speed": self.speed, "lang": lang, "gen": gen])
+            let t0 = Date()
             URLSession.shared.dataTask(with: r) { data, resp, err in
+                if let h = resp as? HTTPURLResponse, h.statusCode == 200 {
+                    log(String(format: "Kokoro: %d chars, made in %@s, total %.2fs", text.count,
+                               (h.value(forHTTPHeaderField: "X-Synth-Seconds") ?? "?"), Date().timeIntervalSince(t0)))
+                }
                 if let err = err { self.ready = false; done(nil, [], err.localizedDescription); return }
                 guard (resp as? HTTPURLResponse)?.statusCode == 200, let d = data else {
                     done(nil, [], "Kokoro error " + (data.flatMap { String(data: $0, encoding: .utf8) } ?? "")); return
@@ -436,6 +546,9 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
     private var elLastWord = -1
     private var elCache: [Int: (Data?, [ElevenWord], String?)] = [:]
     private var elWaiting: [Int: (Data?, [ElevenWord], String?) -> Void] = [:]
+    private var elStarted: Date?
+    /// A number that keeps growing across launches, so the voice server can tell new readings from old ones.
+    let readingNumber = Int(Date().timeIntervalSince1970) * 1000
     var onWord: ((NSRange) -> Void)?
     var onDone: (() -> Void)?
 
@@ -485,6 +598,50 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
         return out
     }
 
+    /// Pieces for AI voices. The very first piece is just the opening words (a phrase), so the voice
+    /// starts almost at once; then pieces grow (a sentence, ~120, ~220, ~320 characters) while the next
+    /// one is always prepared during the current one, so there are no gaps.
+    static func quickPieces(_ text: String) -> [(Int, String)] {
+        let ns = text as NSString
+        var sentences: [NSRange] = []
+        for (off, para) in pieces(text) {
+            let pn = para as NSString
+            pn.enumerateSubstrings(in: NSRange(location: 0, length: pn.length), options: .bySentences) { _, sr, _, _ in
+                sentences.append(NSRange(location: off + sr.location, length: sr.length))
+            }
+        }
+        var out: [(Int, String)] = []
+        if var first = sentences.first, first.length > 60 {
+            let s = ns.substring(with: first) as NSString
+            var cut = 0
+            for mark in [", ", "; ", ": ", " — ", " - "] {
+                let r = s.range(of: mark, options: [], range: NSRange(location: 15, length: min(45, s.length - 15)))
+                if r.location != NSNotFound { cut = NSMaxRange(r); break }
+            }
+            if cut == 0 {
+                let r = s.range(of: " ", options: .backwards, range: NSRange(location: 0, length: min(40, s.length)))
+                if r.location != NSNotFound && r.location > 10 { cut = r.location + 1 }
+            }
+            if cut > 0 {
+                out.append((first.location, s.substring(to: cut)))
+                first = NSRange(location: first.location + cut, length: first.length - cut)
+                sentences[0] = first
+            }
+        }
+        let limits = [0, 120, 220, 320]
+        var cur: NSRange? = nil
+        for sr in sentences {
+            let lim = limits[min(out.count, limits.count - 1)]
+            if let c = cur {
+                if NSMaxRange(sr) - c.location > lim {
+                    out.append((c.location, ns.substring(with: c))); cur = sr
+                } else { cur = NSRange(location: c.location, length: NSMaxRange(sr) - c.location) }
+            } else { cur = sr }
+        }
+        if let c = cur { out.append((c.location, ns.substring(with: c))) }
+        return out.filter { !$0.1.trimmed.isEmpty }
+    }
+
     private func halt() {
         offsets = [:]; lastPiece = nil
         sysQueue = []; sysReading = false; sysPaused = false
@@ -502,7 +659,8 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
         halt()
         if !track && wasReading { onDone?() }
         if track, let ev = elevenVoice {
-            elAll = Speaker.pieces(text); elQueue = elAll
+            elAll = Speaker.quickPieces(text); elQueue = elAll
+            elStarted = Date()
             elReading = true
             nextElevenPiece(ev, elGen)
             return
@@ -557,7 +715,7 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
             }
         }
         if voiceID.hasPrefix(Kokoro.prefix) {
-            Kokoro.shared.speech(text, voice: String(voiceID.dropFirst(Kokoro.prefix.count)), finished)
+            Kokoro.shared.speech(text, voice: String(voiceID.dropFirst(Kokoro.prefix.count)), gen: readingNumber + gen, finished)
         } else {
             Eleven.shared.speech(text, voice: String(voiceID.dropFirst(Eleven.prefix.count)), finished)
         }
@@ -584,7 +742,10 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
             self.elTimer?.invalidate()
             self.elTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in self.elevenTick() }
             // Get the next piece ready while this one plays, so there's no gap.
-            if let next = self.elQueue.first { self.fetchEleven(next.0, next.1, voiceID, gen) }
+            for next in self.elQueue.prefix(2) { self.fetchEleven(next.0, next.1, voiceID, gen) }
+            if let t0 = self.elStarted {
+                log(String(format: "voice started in %.1fs", Date().timeIntervalSince(t0))); self.elStarted = nil
+            }
         }
         if let c = elCache[off], c.2 != "pending" { play(c.0, c.1, c.2) }
         else { elWaiting[off] = play; fetchEleven(off, text, voiceID, gen) }
@@ -1536,15 +1697,25 @@ final class KeyEcho {
 
     var controlDownAt = Date.distantPast
 
-    func flagsChanged(_ code: Int64, _ flags: CGEventFlags) {
+    func flagsChanged(_ code: Int64, _ flags: CGEventFlags, source: Int64 = 0) {
         let isControl = code == 59 || code == 62
+        // Only a real key on your keyboard counts. Other apps sometimes send pretend Control presses
+        // (remote control, automation, accessibility tools); those must never stop the reading.
+        if isControl && source != 0, source != Int64(ProcessInfo.processInfo.processIdentifier),
+           NSRunningApplication(processIdentifier: pid_t(source)) != nil {
+            if controlAlone || flags.contains(.maskControl) { log("ignored a Control press sent by another app (pid \(source))") }
+            controlAlone = false; return
+        }
         let others: CGEventFlags = [.maskCommand, .maskAlternate, .maskShift]
         if isControl && flags.contains(.maskControl) && flags.intersection(others).isEmpty {
             controlAlone = true; controlDownAt = Date()
         } else if isControl && !flags.contains(.maskControl) && controlAlone {
             controlAlone = false
             // Only a quick tap stops speech. Holding Control (to zoom with the magnifier) doesn't.
-            if Date().timeIntervalSince(controlDownAt) < 0.5 { Speaker.shared.stop(); Overlay.shared.hide(); log("stopped by tapping Control") }
+            // A quick tap only (holding Control to zoom doesn't count), and only if that setting is on.
+            if Date().timeIntervalSince(controlDownAt) < 0.35 && !prefs.bool(forKey: "noControlStop") && Speaker.shared.isSpeaking {
+                Speaker.shared.stop(); Overlay.shared.hide(); log("stopped by tapping Control")
+            }
         } else { controlAlone = false }
     }
 
@@ -1579,7 +1750,7 @@ let keyTapCallback: CGEventTapCallBack = { _, type, event, _ in
     let code = event.getIntegerValueField(.keyboardEventKeycode)
     let flags = event.flags
     if type == .flagsChanged {
-        DispatchQueue.main.async { KeyEcho.shared.flagsChanged(code, flags) }
+        let src = event.getIntegerValueField(.eventSourceUnixProcessID); DispatchQueue.main.async { KeyEcho.shared.flagsChanged(code, flags, source: src) }
     } else if type == .keyDown {
         let chars = NSEvent(cgEvent: event)?.characters ?? ""
         let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
@@ -1790,7 +1961,7 @@ let clickTapCallback: CGEventTapCallBack = { _, type, event, _ in
         // Tap Control by itself to stop talking, like VoiceOver. Only used when Key Echo's listener isn't running.
         if KeyEcho.shared.tap == nil {
             let code = event.getIntegerValueField(.keyboardEventKeycode), flags = event.flags
-            if type == .flagsChanged { DispatchQueue.main.async { KeyEcho.shared.flagsChanged(code, flags) } }
+            if type == .flagsChanged { let src = event.getIntegerValueField(.eventSourceUnixProcessID); DispatchQueue.main.async { KeyEcho.shared.flagsChanged(code, flags, source: src) } }
             else { DispatchQueue.main.async { KeyEcho.shared.controlAlone = false } }
         }
         return Unmanaged.passUnretained(event)
@@ -2424,6 +2595,8 @@ struct ReadingPane: View {
                     Spacer()
                 }
                 LabeledContent("Stop at any time") { KeysText(keys: "Tap ⌃ Control") }
+                Toggle("Tapping Control stops reading", isOn: Binding(get: { !prefs.bool(forKey: "noControlStop") },
+                                                                      set: { prefs.set(!$0, forKey: "noControlStop"); model.changed() }))
                 LabeledContent("Or") { KeysText(keys: "⌘-right-click") }
                 LabeledContent("Faster / slower") { KeysText(keys: "⌘ + scroll") }
             }
