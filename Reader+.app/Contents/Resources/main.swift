@@ -78,13 +78,14 @@ extension String { var trimmed: String { trimmingCharacters(in: .whitespacesAndN
 final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
     static let shared = Speaker()
     let synth = AVSpeechSynthesizer()
-    private var reading: AVSpeechUtterance?
+    private var offsets: [ObjectIdentifier: Int] = [:]   // where each piece starts in the full text
+    private var lastPiece: AVSpeechUtterance?
     var onWord: ((NSRange) -> Void)?
     var onDone: (() -> Void)?
 
     override init() { super.init(); synth.delegate = self }
 
-    var isReading: Bool { reading != nil }
+    var isReading: Bool { lastPiece != nil }
     var isPaused: Bool { synth.isPaused }
 
     var voice: AVSpeechSynthesisVoice? {
@@ -92,15 +93,44 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
         return AVSpeechSynthesisVoice(language: AVSpeechSynthesisVoice.currentLanguageCode())
     }
 
+    /// Splits text into pieces of about a paragraph (long paragraphs at sentence ends).
+    static func pieces(_ text: String) -> [(Int, String)] {
+        let ns = text as NSString
+        var out: [(Int, String)] = []
+        ns.enumerateSubstrings(in: NSRange(location: 0, length: ns.length), options: .byParagraphs) { _, pr, _, _ in
+            guard !ns.substring(with: pr).trimmed.isEmpty else { return }
+            if pr.length <= 600 { out.append((pr.location, ns.substring(with: pr))); return }
+            var start = pr.location, end = pr.location
+            ns.enumerateSubstrings(in: pr, options: .bySentences) { _, sr, _, _ in
+                if NSMaxRange(sr) - start > 450 && end > start {
+                    out.append((start, ns.substring(with: NSRange(location: start, length: end - start))))
+                    start = end
+                }
+                end = NSMaxRange(sr)
+            }
+            if NSMaxRange(pr) > start { out.append((start, ns.substring(with: NSRange(location: start, length: NSMaxRange(pr) - start)))) }
+        }
+        return out
+    }
+
     /// Speak text. `track` = this is a reading (word highlighting, reading window).
     func say(_ text: String, track: Bool = false) {
         guard !text.trimmed.isEmpty else { return }
+        let wasReading = lastPiece != nil
+        offsets = [:]; lastPiece = nil
         if synth.isSpeaking || synth.isPaused { synth.stopSpeaking(at: .immediate) }
-        let u = AVSpeechUtterance(string: track ? text : text.trimmed)
-        u.rate = Float(prefs.double(forKey: Key.rate))
-        u.voice = voice
-        if track { reading = u }
-        synth.speak(u)
+        let rate = Float(prefs.double(forKey: Key.rate)), v = voice
+        if !track {
+            if wasReading { onDone?() }
+            let u = AVSpeechUtterance(string: text.trimmed); u.rate = rate; u.voice = v
+            synth.speak(u); return
+        }
+        for (off, piece) in Speaker.pieces(text) {
+            let u = AVSpeechUtterance(string: piece); u.rate = rate; u.voice = v
+            offsets[ObjectIdentifier(u)] = off
+            lastPiece = u
+            synth.speak(u)
+        }
     }
 
     func pauseOrResume() {
@@ -108,18 +138,28 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
         else if synth.isSpeaking { synth.pauseSpeaking(at: .word) }
     }
 
-    func stop() { if synth.isSpeaking || synth.isPaused { synth.stopSpeaking(at: .immediate) } }
+    func stop() {
+        let wasReading = lastPiece != nil
+        offsets = [:]; lastPiece = nil
+        if synth.isSpeaking || synth.isPaused { synth.stopSpeaking(at: .immediate) }
+        if wasReading { onDone?() }
+    }
 
     func speechSynthesizer(_ s: AVSpeechSynthesizer, willSpeakRangeOfSpeechString r: NSRange, utterance u: AVSpeechUtterance) {
-        guard u === reading else { return }
-        DispatchQueue.main.async { self.onWord?(r) }
+        let id = ObjectIdentifier(u)
+        DispatchQueue.main.async {
+            guard let off = self.offsets[id] else { return }
+            self.onWord?(NSRange(location: r.location + off, length: r.length))
+        }
     }
     func speechSynthesizer(_ s: AVSpeechSynthesizer, didFinish u: AVSpeechUtterance) { ended(u) }
     func speechSynthesizer(_ s: AVSpeechSynthesizer, didCancel u: AVSpeechUtterance) { ended(u) }
     private func ended(_ u: AVSpeechUtterance) {
-        guard u === reading else { return }
-        reading = nil
-        DispatchQueue.main.async { self.onDone?() }
+        DispatchQueue.main.async {
+            guard u === self.lastPiece else { return }
+            self.lastPiece = nil; self.offsets = [:]
+            self.onDone?()
+        }
     }
 }
 
@@ -689,7 +729,7 @@ final class Overlay {
         win.contentView = HighlightView()
     }
     func show(axRect r: CGRect, for seconds: Double? = nil) {
-        guard prefs.bool(forKey: Key.screenHighlight), r.width > 0, r.height > 0, r.width < 5000 else { return }
+        guard prefs.bool(forKey: Key.screenHighlight), r.width > 0, r.height > 0, r.width < 1400, r.height < 70 else { hide(); return }
         win.setFrame(cocoaRect(r).insetBy(dx: -4, dy: -3), display: true)
         win.orderFrontRegardless()
         hideWork?.cancel()
@@ -993,12 +1033,18 @@ final class KeyEcho {
         return true
     }
 
+    var controlDownAt = Date.distantPast
+
     func flagsChanged(_ code: Int64, _ flags: CGEventFlags) {
         let isControl = code == 59 || code == 62
         let others: CGEventFlags = [.maskCommand, .maskAlternate, .maskShift]
-        if isControl && flags.contains(.maskControl) && flags.intersection(others).isEmpty { controlAlone = true }
-        else if isControl && !flags.contains(.maskControl) && controlAlone { controlAlone = false; Speaker.shared.stop(); Overlay.shared.hide() }
-        else { controlAlone = false }
+        if isControl && flags.contains(.maskControl) && flags.intersection(others).isEmpty {
+            controlAlone = true; controlDownAt = Date()
+        } else if isControl && !flags.contains(.maskControl) && controlAlone {
+            controlAlone = false
+            // Only a quick tap stops speech. Holding Control (to zoom with the magnifier) doesn't.
+            if Date().timeIntervalSince(controlDownAt) < 0.5 { Speaker.shared.stop(); Overlay.shared.hide(); log("stopped by tapping Control") }
+        } else { controlAlone = false }
     }
 
     func keyDown(_ code: Int64, _ chars: String, _ flags: CGEventFlags) {
@@ -1233,6 +1279,11 @@ let clickTapCallback: CGEventTapCallBack = { _, type, event, _ in
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
         if let t = ClickReader.shared.tap { CGEvent.tapEnable(tap: t, enable: true) }
         return Unmanaged.passUnretained(event)
+    }
+    // Scrolling or clicking while Control is held (zooming, Control-click) isn't a "tap" of Control.
+    if (type == .scrollWheel || type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown),
+       event.flags.contains(.maskControl) {
+        DispatchQueue.main.async { KeyEcho.shared.controlAlone = false }
     }
     if type == .flagsChanged || type == .keyDown {
         // Tap Control by itself to stop talking, like VoiceOver. Only used when Key Echo's listener isn't running.
