@@ -2,6 +2,21 @@
 
 ## Unreleased — responsiveness fixes (2026-11-13)
 
+### Follow-up audit and reproducible regressions
+
+- Reject invalid, missing and overflowing text positions; use screen text rather than crashing or reading the wrong document start.
+- Keep complete single paragraphs across nested formatting containers.
+- Anchor screen-text fallback to the pointer's paragraph and column, including correct coordinates when a capture is clipped at a screen edge.
+- Capture Reader+'s own visible text too, excluding only its highlight overlay.
+- Clear pending readings when screen-text recognition is unavailable or lacks permission.
+- Preserve leading whitespace so system-voice word highlighting stays aligned.
+- Cancel stale reading-button actions during application switching.
+- Replay native selection clicks to their original process, and preserve their down/up pairing even when speech is cancelled before classification.
+- Add reproducible regression fixtures under `tests/`, using isolated test preferences/logs, actual macOS Vision OCR, and actual system/Apple speech.
+
+Validation: the expanded pipeline and speech suites passed. Repeated system-voice first-word timings in this audit were 0.045–0.085 seconds; the initial system start took 0.477 seconds and the installed Apple-voice case took 0.237 seconds. The final callback test remained below 0.3 ms with a simulated 250 ms target delay. These measurements describe the test run, not guaranteed response times. See `tests/README.md` for transport substitutions and verification limits.
+
+
 ### Command-click correction
 
 - Route Command-click through the same reading pipeline for Reader+'s own text and other apps' text. The previous special case could silently pass or discard a click based on Reader+'s window geometry, including when its window was covered by another app.

@@ -675,7 +675,7 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
         }
         let generation = speechGeneration
         if useSystemVoice {
-            sysPending = (text.trimmed, track)
+            sysPending = (text, track)
             sysReading = track
             startPendingSystem()
             // If the OS loses a stop callback, recover instead of silently dropping the next click.
@@ -951,7 +951,9 @@ func axParam(_ e: AXUIElement, _ attr: String, _ p: CFTypeRef) -> CFTypeRef? {
 func axRangeValue(_ v: CFTypeRef?) -> CFRange? {
     guard let v = v, CFGetTypeID(v) == AXValueGetTypeID() else { return nil }
     var r = CFRange()
-    return AXValueGetValue(v as! AXValue, .cfRange, &r) ? r : nil
+    guard AXValueGetValue(v as! AXValue, .cfRange, &r),
+          r.location >= 0, r.location != NSNotFound, r.length >= 0, r.length != NSNotFound, r.location <= Int.max - r.length else { return nil }
+    return r
 }
 func axRectValue(_ v: CFTypeRef?) -> CGRect? {
     guard let v = v, CFGetTypeID(v) == AXValueGetTypeID() else { return nil }
@@ -1105,6 +1107,12 @@ func blockStart(_ chain: [AXUIElement], within root: AXUIElement) -> AXUIElement
 /// With `startNode`, it starts there (the spot you clicked) and only goes forward, so even the
 /// bottom of a very long page (a YouTube list, a long feed) is reached quickly.
 func collectBlocks(_ root: AXUIElement, from startNode: AXUIElement? = nil, sectionOnly: Bool = false, paragraphOnly: Bool = false) -> [DocBlock] {
+    if paragraphOnly, let start = startNode, axString(start, "AXRole") != "AXHeading" {
+        // A paragraph may split a sentence into nested bold/link/span containers. Read its
+        // complete subtree rather than treating the first formatting boundary as the end.
+        let text = collectText(start).trimmed
+        return text.isEmpty ? [] : [DocBlock(element: start, text: text, heading: 0)]
+    }
     var blocks: [DocBlock] = []
     var visited = 0
     var finished = false
@@ -1203,6 +1211,14 @@ func sourceFromBlocks(_ blocks: [DocBlock], start index: Int, sectionOnly: Bool,
     return src
 }
 
+/// Returns only valid UTF-16 paragraph ranges. Missing/invalid positions must use the
+/// screen-text fallback rather than crashing or silently reading the start of a document.
+func clickedReadingRange(_ text: NSString, at location: Int?, paragraphOnly: Bool) -> NSRange? {
+    guard let location = location, location >= 0, location < text.length else { return nil }
+    let para = text.paragraphRange(for: NSRange(location: location, length: 0))
+    return paragraphOnly ? para : NSRange(location: para.location, length: text.length - para.location)
+}
+
 /// ⌘-click: read by structure at a screen point (top-left coordinates). Returns nil if there's nothing to read.
 func readSourceAt(_ p: CGPoint, hitElement: AXUIElement? = nil) -> ReadSource? {
     var found: AXUIElement? = hitElement
@@ -1216,9 +1232,8 @@ func readSourceAt(_ p: CGPoint, hitElement: AXUIElement? = nil) -> ReadSource? {
        !chain.contains(where: { axString($0, "AXRole") == "AXWebArea" }),
        let v = axString(ta, "AXValue"), !v.trimmed.isEmpty {
         let ns = v as NSString
-        let idx = min(axRangeValue(axParam(ta, "AXRangeForPosition", makePoint(p)))?.location ?? 0, max(ns.length - 1, 0))
-        let para = ns.paragraphRange(for: NSRange(location: idx, length: 0))
-        let r = paragraphOnly ? para : NSRange(location: para.location, length: ns.length - para.location)
+        let idx = axRangeValue(axParam(ta, "AXRangeForPosition", makePoint(p)))?.location
+        guard let r = clickedReadingRange(ns, at: idx, paragraphOnly: paragraphOnly) else { return nil }
         return ReadSource(text: ns.substring(with: r), element: ta, base: r.location)
     }
 
@@ -1356,12 +1371,14 @@ enum ClickUse { case ignore, read, readAndPass }
 /// What a ⌘-click at this point should do. Everything on a web page is read, links included.
 /// In other apps, text and controls are read too; in lists where ⌘-click selects things
 /// (Finder, Mail, the Dock), Reader+ reads the item and still lets the click select it.
-func clickUse(_ p: CGPoint) -> ClickUse {
+func clickUse(_ p: CGPoint, hitElement: inout AXUIElement?, targetPID: inout pid_t) -> ClickUse {
     var found: AXUIElement?
     guard AXUIElementCopyElementAtPosition(systemWide, Float(p.x), Float(p.y), &found) == .success, let hit = found else { return .read }
+    hitElement = hit
     AXUIElementSetMessagingTimeout(hit, 0.25)
     var pid: pid_t = 0
     if AXUIElementGetPid(hit, &pid) == .success {
+        targetPID = pid
         exposeText(pid)
         if NSRunningApplication(processIdentifier: pid)?.bundleIdentifier == "com.apple.dock" { return .readAndPass }
     }
@@ -1990,19 +2007,20 @@ func askForScreenRecording() {
     say("To read text in pictures, Reader plus needs Screen Recording permission. Turn on Reader plus in System Settings, Privacy and Security, Screen and System Audio Recording. Then quit and reopen Reader plus.")
 }
 
-/// Takes a picture of part of the screen (top-left screen coordinates), leaving out Reader+'s own windows.
-func captureScreen(_ rect: CGRect, _ done: @escaping (CGImage?) -> Void) {
-    guard #available(macOS 14.0, *) else { done(nil); return }
+/// Takes a picture of the visible text, excluding only the click-through highlight overlay.
+func captureScreen(_ rect: CGRect, _ done: @escaping (CGImage?, CGRect) -> Void) {
+    guard #available(macOS 14.0, *) else { done(nil, rect); return }
+    let overlayID = CGWindowID(clamping: Overlay.shared.win.windowNumber)
     Task {
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
             let center = CGPoint(x: rect.midX, y: rect.midY)
-            guard let display = content.displays.first(where: { $0.frame.contains(center) }) ?? content.displays.first else { done(nil); return }
-            let mine = content.windows.filter { $0.owningApplication?.processID == ProcessInfo.processInfo.processIdentifier }
-            let filter = SCContentFilter(display: display, excludingWindows: mine)
+            guard let display = content.displays.first(where: { $0.frame.contains(center) }) ?? content.displays.first else { done(nil, rect); return }
+            let overlays = content.windows.filter { $0.windowID == overlayID }
+            let filter = SCContentFilter(display: display, excludingWindows: overlays)
             let local = rect.offsetBy(dx: -display.frame.minX, dy: -display.frame.minY)
                 .intersection(CGRect(origin: .zero, size: display.frame.size))
-            guard local.width > 4, local.height > 4 else { done(nil); return }
+            guard local.width > 4, local.height > 4 else { done(nil, rect); return }
             let cfg = SCStreamConfiguration()
             let scale = CGFloat(filter.pointPixelScale)
             cfg.sourceRect = local
@@ -2010,29 +2028,68 @@ func captureScreen(_ rect: CGRect, _ done: @escaping (CGImage?) -> Void) {
             cfg.height = Int(local.height * scale)
             cfg.showsCursor = false
             let img = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)
-            done(img)
+            done(img, local.offsetBy(dx: display.frame.minX, dy: display.frame.minY))
         } catch {
             log("screen capture failed: \(error.localizedDescription)")
-            done(nil)
+            done(nil, rect)
         }
     }
 }
 
-/// Finds the words in a picture, top to bottom.
-func recognizeText(_ img: CGImage, _ done: @escaping (String) -> Void) {
+struct OCRLine {
+    let text: String
+    let bounds: CGRect // normalized Vision coordinates, bottom-left origin
+}
+
+/// Whole pictures are read top-to-bottom. For the click fallback, select the paragraph
+/// containing the pointer, rather than reading unrelated text above it or in another column.
+func recognizedText(_ lines: [OCRLine], readingAt point: CGPoint? = nil) -> String {
+    let sorted = lines.filter { !$0.text.trimmed.isEmpty }.sorted { a, b in
+        abs(a.bounds.midY - b.bounds.midY) > 0.012 ? a.bounds.midY > b.bounds.midY
+                                                                : a.bounds.minX < b.bounds.minX
+    }
+    guard !sorted.isEmpty else { return "" }
+    var selected = sorted
+    if let point = point {
+        func distance(_ line: OCRLine) -> CGFloat {
+            let r = line.bounds
+            let dx = max(r.minX - point.x, 0, point.x - r.maxX)
+            let dy = max(r.minY - point.y, 0, point.y - r.maxY)
+            return dx * dx + 4 * dy * dy
+        }
+        guard let anchor = sorted.min(by: { distance($0) < distance($1) }) else { return "" }
+        let column = sorted.filter { line in
+            let overlap = min(anchor.bounds.maxX, line.bounds.maxX) - max(anchor.bounds.minX, line.bounds.minX)
+            return overlap > min(anchor.bounds.width, line.bounds.width) * 0.3 || abs(anchor.bounds.minX - line.bounds.minX) < 0.02
+        }
+        guard let at = column.firstIndex(where: { $0.bounds == anchor.bounds && $0.text == anchor.text }) else { return anchor.text }
+        func adjoining(_ upper: OCRLine, _ lower: OCRLine) -> Bool {
+            let gap = upper.bounds.minY - lower.bounds.maxY
+            let height = max(upper.bounds.height, lower.bounds.height)
+            return upper.bounds.midY > lower.bounds.midY && gap >= -height * 0.2 && gap <= height * 0.8
+        }
+        var first = at, last = at
+        while first > 0 && adjoining(column[first - 1], column[first]) { first -= 1 }
+        while last + 1 < column.count && adjoining(column[last], column[last + 1]) { last += 1 }
+        selected = Array(column[first...last])
+    }
+    var out = ""
+    for line in selected {
+        if out.isEmpty { out = line.text.trimmed; continue }
+        out += ".!?:".contains(out.last ?? " ") ? "\n" + line.text.trimmed : " " + line.text.trimmed
+    }
+    return out
+}
+
+/// Finds the words in a picture, with optional pointer-based paragraph selection.
+func recognizeText(_ img: CGImage, readingAt point: CGPoint? = nil, _ done: @escaping (String) -> Void) {
     let req = VNRecognizeTextRequest { r, _ in
         let obs = (r.results as? [VNRecognizedTextObservation]) ?? []
-        let sorted = obs.sorted { a, b in
-            abs(a.boundingBox.midY - b.boundingBox.midY) > 0.012 ? a.boundingBox.midY > b.boundingBox.midY
-                                                                  : a.boundingBox.minX < b.boundingBox.minX
+        let lines = obs.compactMap { o -> OCRLine? in
+            guard let text = o.topCandidates(1).first?.string.trimmed, !text.isEmpty else { return nil }
+            return OCRLine(text: text, bounds: o.boundingBox)
         }
-        var out = ""
-        for o in sorted {
-            guard let line = o.topCandidates(1).first?.string.trimmed, !line.isEmpty else { continue }
-            if out.isEmpty { out = line; continue }
-            out += ".!?:".contains(out.last ?? " ") ? "\n" + line : " " + line
-        }
-        done(out)
+        done(recognizedText(lines, readingAt: point))
     }
     req.recognitionLevel = .accurate
     req.usesLanguageCorrection = true
@@ -2044,12 +2101,21 @@ func recognizeText(_ img: CGImage, _ done: @escaping (String) -> Void) {
 }
 
 /// Reads the words found in an area of the screen. `fallback` is used if no words are found (e.g. an image description).
-func ocrRead(_ rect: CGRect, fallback: String? = nil, showWindow: Bool = true, request: ReadRequest? = nil) {
-    guard #available(macOS 14.0, *) else { say("Reading text in pictures needs macOS 14 or later."); return }
-    guard hasScreenRecording else { askForScreenRecording(); return }
+func ocrRead(_ rect: CGRect, fallback: String? = nil, showWindow: Bool = true, request: ReadRequest? = nil, readingAt point: CGPoint? = nil) {
+    guard request?.valid != false else { return }
+    guard #available(macOS 14.0, *) else {
+        if request != nil { ClickReader.shared.cancelPending() }
+        ReaderModel.shared.activity = "Screen-text reading needs macOS 14 or later."
+        say("Reading text in pictures needs macOS 14 or later."); return
+    }
+    guard hasScreenRecording else {
+        if request != nil { ClickReader.shared.cancelPending() }
+        ReaderModel.shared.activity = "Screen Recording permission is needed for screen text."
+        askForScreenRecording(); return
+    }
     Overlay.shared.show(axRect: rect, for: 1.2)
     request?.trace("OCR started")
-    captureScreen(rect) { img in
+    captureScreen(rect) { img, capturedRect in
         guard request?.valid != false else { return }
         guard let img = img else {
             DispatchQueue.main.async {
@@ -2060,7 +2126,9 @@ func ocrRead(_ rect: CGRect, fallback: String? = nil, showWindow: Bool = true, r
             }
             return
         }
-        recognizeText(img) { text in
+        let normalized = point.map { p in CGPoint(x: (p.x - capturedRect.minX) / capturedRect.width,
+                                                  y: 1 - (p.y - capturedRect.minY) / capturedRect.height) }
+        recognizeText(img, readingAt: normalized) { text in
             DispatchQueue.main.async {
                 guard request?.valid != false else { return }
                 if !text.trimmed.isEmpty {
@@ -2112,7 +2180,11 @@ final class ClickReader {
         let down: CGEvent
         var up: CGEvent?
         var pass = false
-        init(_ event: CGEvent) { down = event.copy()! }
+        var targetPID: pid_t
+        init(_ event: CGEvent) {
+            down = event.copy()!
+            targetPID = pid_t(clamping: event.getIntegerValueField(.eventTargetUnixProcessID))
+        }
     }
     private var heldClick: CapturedClick?
 
@@ -2140,9 +2212,10 @@ final class ClickReader {
             r.trace("waiting for app text")
         }
     }
-    private func replay(_ event: CGEvent) {
+    private func replay(_ event: CGEvent, to targetPID: pid_t) {
+        guard targetPID > 0 else { log("native click target unavailable; not replaying into a different app"); return }
         event.setIntegerValueField(.eventSourceUserData, value: Self.replayMarker)
-        event.post(tap: .cgSessionEventTap)
+        event.postToPid(targetPID)
     }
     func capture(_ event: CGEvent) {
         let click = CapturedClick(event), point = event.location
@@ -2150,19 +2223,23 @@ final class ClickReader {
         let r = makeRequest()
         // Return to the event tap before stopping speech, logging, or contacting another app.
         DispatchQueue.main.async {
-          guard r.valid else { return }
-          self.prepare(r)
+          if r.valid { self.prepare(r) }
+          // Classification must still finish for a cancelled reading: a real native
+          // selection click and its mouse-up must not disappear with the speech request.
           DispatchQueue.global(qos: .userInitiated).async {
-            let use = AXWork.run(seconds: 0.35) { clickUse(point) }
+            var hit: AXUIElement?
+            var pid: pid_t = 0
+            let use = AXWork.run(seconds: 0.35) { clickUse(point, hitElement: &hit, targetPID: &pid) }
             r.trace("click classified")
             DispatchQueue.main.async {
+                if click.targetPID <= 0 { click.targetPID = pid }
                 if use == .readAndPass || use == .ignore {
                     click.pass = true
-                    self.replay(click.down)
-                    if let up = click.up { self.replay(up) }
+                    self.replay(click.down, to: click.targetPID)
+                    if let up = click.up { self.replay(up, to: click.targetPID) }
                 }
                 guard r.valid else { return }
-                self.read(at: point, request: r)
+                self.read(at: point, request: r, hitElement: hit)
             }
           }
         }
@@ -2170,7 +2247,7 @@ final class ClickReader {
     func release(_ event: CGEvent) -> Bool {
         guard let click = heldClick else { return false }
         heldClick = nil
-        if click.pass { replay(event.copy()!) } else { click.up = event.copy() }
+        if click.pass { replay(event.copy()!, to: click.targetPID) } else { click.up = event.copy() }
         return true
     }
     func deliver(_ src: ReadSource?, request r: ReadRequest, showWindow: Bool) {
@@ -2239,13 +2316,13 @@ final class ClickReader {
         return mode != 2 || f.contains(.maskAlternate)
     }
 
-    func read(at p: CGPoint, request: ReadRequest? = nil) {
+    func read(at p: CGPoint, request: ReadRequest? = nil, hitElement: AXUIElement? = nil) {
         let r = request ?? begin()
         let showWindow = prefs.bool(forKey: Key.clickShowsReader)
         DispatchQueue.global(qos: .userInitiated).async {
             guard r.valid else { return }
-            var hit: AXUIElement?
-            _ = AXUIElementCopyElementAtPosition(systemWide, Float(p.x), Float(p.y), &hit)
+            var hit: AXUIElement? = hitElement
+            if hit == nil { _ = AXUIElementCopyElementAtPosition(systemWide, Float(p.x), Float(p.y), &hit) }
             guard r.valid else { return }
             let image: (CGRect, String?)? = AXWork.run(seconds: 0.25, valid: { r.valid }) {
                 guard let h = hit else { return nil }
@@ -2278,11 +2355,11 @@ final class ClickReader {
                 if timedOut {
                     r.trace("text lookup deadline exceeded; reading screen text instead")
                     ReaderModel.shared.activity = "Reading text from the screen…"
-                    ocrRead(CGRect(x: p.x - 450, y: p.y - 140, width: 900, height: 280), showWindow: showWindow, request: r)
+                    ocrRead(CGRect(x: p.x - 450, y: p.y - 140, width: 900, height: 280), showWindow: showWindow, request: r, readingAt: p)
                     return
                 }
                 if let s = src, !s.text.trimmed.isEmpty { self.deliver(s, request: r, showWindow: showWindow); return }
-                ocrRead(CGRect(x: p.x - 450, y: p.y - 140, width: 900, height: 280), showWindow: showWindow, request: r)
+                ocrRead(CGRect(x: p.x - 450, y: p.y - 140, width: 900, height: 280), showWindow: showWindow, request: r, readingAt: p)
             }
         }
     }
@@ -2728,9 +2805,16 @@ final class PreviousApp {
     /// Switch back to the app you were using, then do something there.
     func run(_ action: @escaping () -> Void) {
         if NSApp.isActive, let a = app {
+            let intent = ClickReader.shared.begin()
             a.activate(options: [])
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: action)
+            Self.finishSwitch(intent, action)
         } else { action() }
+    }
+    static func finishSwitch(_ intent: ReadRequest, _ action: @escaping () -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+            guard intent.valid else { return }
+            action()
+        }
     }
 }
 
