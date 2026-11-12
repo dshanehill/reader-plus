@@ -529,10 +529,15 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
     private var sys = NSSpeechSynthesizer()
     private var offsets: [ObjectIdentifier: Int] = [:]   // where each piece starts in the full text
     private var lastPiece: AVSpeechUtterance?
-    private var sysQueue: [(Int, String)] = []
     private var sysOffset = 0
     private var sysReading = false
     private var sysPaused = false
+    private var sysBusy = false
+    private var sysPending: (String, Bool)?
+    private var sysVoice = NSSpeechSynthesizer.defaultVoice
+    private var speechStarted: TimeInterval?
+    private var speechGeneration = 0
+    var request: ReadRequest?
     // ElevenLabs
     private var elQueue: [(Int, String)] = []
     private var elAll: [(Int, String)] = []
@@ -644,12 +649,13 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
 
     private func halt() {
         offsets = [:]; lastPiece = nil
-        sysQueue = []; sysReading = false; sysPaused = false
+        sysReading = false; sysPaused = false; sysPending = nil
+        speechGeneration += 1; speechStarted = nil
         elGen += 1; elQueue = []; elAll = []; elReading = false; elPaused = false
         elCache = [:]; elWaiting = [:]; elTimer?.invalidate(); elTimer = nil
         elPlayer?.stop(); elPlayer = nil
         if synth.isSpeaking || synth.isPaused { synth.stopSpeaking(at: .immediate) }
-        if sys.isSpeaking { sys.stopSpeaking() }
+        if sysBusy { sys.stopSpeaking() }
     }
 
     /// Speak text. `track` = this is a reading (word highlighting, reading window).
@@ -658,24 +664,35 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
         let wasReading = isReading
         halt()
         if !track && wasReading { onDone?() }
+        speechStarted = track ? ProcessInfo.processInfo.systemUptime : nil
         if track, let ev = elevenVoice {
+            monitorSpeechStart(speechGeneration)
             elAll = Speaker.quickPieces(text); elQueue = elAll
             elStarted = Date()
             elReading = true
             nextElevenPiece(ev, elGen)
             return
         }
+        let generation = speechGeneration
         if useSystemVoice {
-            let s = NSSpeechSynthesizer()   // a fresh one, so a newly chosen System Voice is used
-            s.delegate = self
-            s.rate = wordsPerMinute
-            sys = s
-            if !track { s.startSpeaking(text.trimmed); return }
-            sysQueue = Speaker.pieces(text)
-            sysReading = true
-            nextSystemPiece()
+            sysPending = (text.trimmed, track)
+            sysReading = track
+            startPendingSystem()
+            // If the OS loses a stop callback, recover instead of silently dropping the next click.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                guard generation == self.speechGeneration, self.sysPending != nil else { return }
+                if !self.sys.isSpeaking {
+                    self.sys.delegate = nil
+                    self.sys = NSSpeechSynthesizer(voice: NSSpeechSynthesizer.defaultVoice) ?? NSSpeechSynthesizer()
+                    self.sys.delegate = self; self.sysBusy = false
+                    log("system voice recovered after missing stop acknowledgement")
+                    self.startPendingSystem()
+                }
+            }
+            monitorSpeechStart(generation)
             return
         }
+        monitorSpeechStart(generation)
         let rate = Float(prefs.double(forKey: Key.rate)), v = voice
         if !track {
             let u = AVSpeechUtterance(string: text.trimmed); u.rate = rate; u.voice = v
@@ -695,12 +712,39 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
         }
     }
 
-    private func nextSystemPiece() {
-        guard sysReading else { return }
-        guard !sysQueue.isEmpty else { sysReading = false; onDone?(); return }
-        let (off, text) = sysQueue.removeFirst()
-        sysOffset = off
-        if !sys.startSpeaking(text) { sysReading = false; onDone?() }
+    private func startPendingSystem() {
+        guard !sysBusy, let pending = sysPending else { return }
+        let selected = NSSpeechSynthesizer.defaultVoice
+        if selected != sysVoice {
+            sys.delegate = nil
+            sys = NSSpeechSynthesizer(voice: selected) ?? NSSpeechSynthesizer()
+            sys.delegate = self; sysVoice = selected
+        }
+        sys.rate = wordsPerMinute
+        sysPending = nil; sysOffset = 0; sysBusy = true
+        // One utterance avoids stopping and restarting the system engine at every paragraph.
+        if !sys.startSpeaking(pending.0) {
+            sysBusy = false; sysReading = false
+            request?.trace("system voice rejected speech")
+            log("system voice rejected speech; falling back to installed Apple voice")
+            speakApple(Speaker.pieces(pending.0))
+        }
+    }
+
+    private func markSpeechStarted(_ engine: String) {
+        guard let started = speechStarted else { return }
+        speechStarted = nil
+        log(String(format: "%@ first word after %.3fs", engine, ProcessInfo.processInfo.systemUptime - started))
+        request?.trace("first word (\(engine))")
+        ReaderModel.shared.activity = "Reading"
+    }
+
+    private func monitorSpeechStart(_ generation: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            guard generation == self.speechGeneration, self.speechStarted != nil else { return }
+            self.request?.trace("waiting for voice")
+            ReaderModel.shared.activity = "Waiting for the voice to start…"
+        }
     }
 
     private func fetchEleven(_ off: Int, _ text: String, _ voiceID: String, _ gen: Int) {
@@ -739,6 +783,7 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
             self.elWords = words.isEmpty ? estimateWords(text, duration: player.duration) : words
             self.elOffset = off; self.elLastWord = -1
             player.prepareToPlay(); player.play()
+            self.markSpeechStarted(voiceID.hasPrefix(Kokoro.prefix) ? "Kokoro" : "ElevenLabs")
             self.elTimer?.invalidate()
             self.elTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in self.elevenTick() }
             // Get the next piece ready while this one plays, so there's no gap.
@@ -785,22 +830,33 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
     }
 
     func stop() {
+        ClickReader.shared.cancelPending()
+        request?.trace("stopped"); request = nil
+        ReaderModel.shared.activity = "Stopped"
         let wasReading = isReading
         halt()
         if wasReading { onDone?() }
+        Reading.shared.generation += 1
+        Overlay.shared.hide()
     }
 
     // System Voice (Siri) callbacks
     func speechSynthesizer(_ sender: NSSpeechSynthesizer, willSpeakWord characterRange: NSRange, of string: String) {
         DispatchQueue.main.async {
-            guard sender === self.sys, self.sysReading else { return }
+            guard sender === self.sys, self.sysPending == nil, self.sysBusy else { return }
+            self.markSpeechStarted("system voice")
+            guard self.sysReading else { return }
             self.onWord?(NSRange(location: characterRange.location + self.sysOffset, length: characterRange.length))
         }
     }
     func speechSynthesizer(_ sender: NSSpeechSynthesizer, didFinishSpeaking finishedSpeaking: Bool) {
         DispatchQueue.main.async {
-            guard sender === self.sys, self.sysReading else { return }
-            self.nextSystemPiece()
+            guard sender === self.sys else { return }
+            self.sysBusy = false
+            if self.sysPending != nil { self.startPendingSystem(); return }
+            guard self.sysReading else { return }
+            self.sysReading = false; self.speechStarted = nil
+            self.onDone?()
         }
     }
 
@@ -809,6 +865,7 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
         let id = ObjectIdentifier(u)
         DispatchQueue.main.async {
             guard let off = self.offsets[id] else { return }
+            self.markSpeechStarted("Apple voice")
             self.onWord?(NSRange(location: r.location + off, length: r.length))
         }
     }
@@ -825,13 +882,58 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
 
 func say(_ s: String) { Speaker.shared.say(s) }
 /// A voice sample: spoken with the chosen reading voice (ElevenLabs too).
-func sample(_ s: String) { Speaker.shared.say(s, track: true) }
+func sample(_ s: String) { Speaker.shared.request = nil; Speaker.shared.say(s, track: true) }
+
+// MARK: - Bounded, cancellable accessibility work
+
+/// A slow or unresponsive target must never hold the mouse event callback or UI thread.
+final class AXWork: NSObject {
+    static let key = "ReaderPlus.AXWork"
+    let deadline: TimeInterval
+    let valid: () -> Bool
+    var calls = 0
+    var timeouts = 0
+    var expired: Bool { ProcessInfo.processInfo.systemUptime >= deadline || !valid() }
+    init(seconds: Double, valid: @escaping () -> Bool = { true }) {
+        deadline = ProcessInfo.processInfo.systemUptime + seconds; self.valid = valid
+    }
+    static var current: AXWork? { Thread.current.threadDictionary[key] as? AXWork }
+    static func run<T>(seconds: Double, valid: @escaping () -> Bool = { true }, _ body: () -> T) -> T {
+        let previous = Thread.current.threadDictionary[key]
+        Thread.current.threadDictionary[key] = AXWork(seconds: seconds, valid: valid)
+        defer { Thread.current.threadDictionary[key] = previous }
+        return body()
+    }
+    static func prepare(_ e: AXUIElement) -> Bool {
+        guard let w = current else { AXUIElementSetMessagingTimeout(e, 0.15); return true }
+        guard !w.expired else { return false }
+        w.calls += 1
+        AXUIElementSetMessagingTimeout(e, Float(min(0.12, max(0.001, w.deadline - ProcessInfo.processInfo.systemUptime))))
+        return true
+    }
+}
+
+final class ReadRequest {
+    let id: Int
+    let started = ProcessInfo.processInfo.systemUptime
+    private let lock = NSLock()
+    private var cancelled = false
+    init(_ id: Int) { self.id = id }
+    var valid: Bool { lock.lock(); defer { lock.unlock() }; return !cancelled }
+    func cancel() { lock.lock(); cancelled = true; lock.unlock() }
+    func trace(_ stage: String) {
+        log(String(format: "read #%d %@ at %.3fs", id, stage, ProcessInfo.processInfo.systemUptime - started))
+    }
+}
 
 // MARK: - Accessibility helpers
 
 func ax(_ e: AXUIElement, _ attr: String) -> CFTypeRef? {
+    guard AXWork.prepare(e) else { return nil }
     var v: CFTypeRef?
-    return AXUIElementCopyAttributeValue(e, attr as CFString, &v) == .success ? v : nil
+    let result = AXUIElementCopyAttributeValue(e, attr as CFString, &v)
+    if result == .cannotComplete { AXWork.current?.timeouts += 1 }
+    return result == .success ? v : nil
 }
 func axString(_ e: AXUIElement, _ attr: String) -> String? { ax(e, attr) as? String }
 func axElement(_ e: AXUIElement, _ attr: String) -> AXUIElement? {
@@ -840,8 +942,11 @@ func axElement(_ e: AXUIElement, _ attr: String) -> AXUIElement? {
 }
 func axChildren(_ e: AXUIElement) -> [AXUIElement] { (ax(e, "AXChildren") as? [AXUIElement]) ?? [] }
 func axParam(_ e: AXUIElement, _ attr: String, _ p: CFTypeRef) -> CFTypeRef? {
+    guard AXWork.prepare(e) else { return nil }
     var v: CFTypeRef?
-    return AXUIElementCopyParameterizedAttributeValue(e, attr as CFString, p, &v) == .success ? v : nil
+    let result = AXUIElementCopyParameterizedAttributeValue(e, attr as CFString, p, &v)
+    if result == .cannotComplete { AXWork.current?.timeouts += 1 }
+    return result == .success ? v : nil
 }
 func axRangeValue(_ v: CFTypeRef?) -> CFRange? {
     guard let v = v, CFGetTypeID(v) == AXValueGetTypeID() else { return nil }
@@ -864,20 +969,29 @@ func focusedElement() -> AXUIElement? { axElement(systemWide, "AXFocusedUIElemen
 func frontAppElement() -> AXUIElement? {
     guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
     let e = AXUIElementCreateApplication(app.processIdentifier)
-    AXUIElementSetAttributeValue(e, "AXManualAccessibility" as CFString, kCFBooleanTrue)
-    AXUIElementSetMessagingTimeout(e, 1.5)
+    AXUIElementSetMessagingTimeout(e, 0.12)
+    exposeText(app.processIdentifier)
     return e
 }
 
 var exposedPIDs = Set<pid_t>()
+let exposedLock = NSLock()
 /// Chromium and Electron apps (Chrome, Claude, ChatGPT, Slack, Discord…) only share their page text with
 /// assistive apps once asked. VoiceOver asks automatically; Reader+ asks here.
 func exposeText(_ pid: pid_t) {
-    guard pid != ProcessInfo.processInfo.processIdentifier, !exposedPIDs.contains(pid) else { return }
-    exposedPIDs.insert(pid)
-    let e = AXUIElementCreateApplication(pid)
-    AXUIElementSetMessagingTimeout(e, 0.5)
-    AXUIElementSetAttributeValue(e, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+    guard pid != ProcessInfo.processInfo.processIdentifier else { return }
+    exposedLock.lock()
+    let fresh = exposedPIDs.insert(pid).inserted
+    exposedLock.unlock()
+    guard fresh else { return }
+    DispatchQueue.global(qos: .userInitiated).async {
+        let e = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(e, 0.15)
+        let result = AXUIElementSetAttributeValue(e, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        if result == .cannotComplete {
+            exposedLock.lock(); exposedPIDs.remove(pid); exposedLock.unlock()
+        }
+    }
 }
 
 /// Roles where ⌘-click means something else (selecting several files, rows or list items).
@@ -990,15 +1104,21 @@ func blockStart(_ chain: [AXUIElement], within root: AXUIElement) -> AXUIElement
 /// Splits a web page (or other content) into headings and paragraphs, in reading order.
 /// With `startNode`, it starts there (the spot you clicked) and only goes forward, so even the
 /// bottom of a very long page (a YouTube list, a long feed) is reached quickly.
-func collectBlocks(_ root: AXUIElement, from startNode: AXUIElement? = nil) -> [DocBlock] {
+func collectBlocks(_ root: AXUIElement, from startNode: AXUIElement? = nil, sectionOnly: Bool = false, paragraphOnly: Bool = false) -> [DocBlock] {
     var blocks: [DocBlock] = []
     var visited = 0
+    var finished = false
     var path: [AXUIElement] = []
     if let st = startNode {
         let up = ancestors(st, max: 150)
         if let ri = up.firstIndex(where: { CFEqual($0, root) }) { path = Array(up[0...ri].reversed()) }
     }
     func add(_ text: String, _ container: AXUIElement, _ heading: Int) {
+        if finished { return }
+        if let first = blocks.first {
+            if paragraphOnly && first.heading == 0 && !CFEqual(first.element, container) { finished = true; return }
+            if sectionOnly && first.heading > 0 && heading > 0 && heading <= first.heading && !CFEqual(first.element, container) { finished = true; return }
+        }
         if var last = blocks.last {
             if CFEqual(last.element, container) && last.heading == heading {
                 last.text += " " + text; blocks[blocks.count - 1] = last; return
@@ -1013,7 +1133,7 @@ func collectBlocks(_ root: AXUIElement, from startNode: AXUIElement? = nil) -> [
         blocks.append(DocBlock(element: container, text: text, heading: heading))
     }
     func walk(_ e: AXUIElement, _ depth: Int, _ container: AXUIElement, _ heading: Int, _ pi: Int?) {
-        if visited > 40000 || depth > 150 { return }
+        if finished || AXWork.current?.expired == true || visited > 40000 || depth > 150 { return }
         visited += 1
         let role = axString(e, "AXRole") ?? ""
         if skipRoles.contains(role) { return }
@@ -1084,10 +1204,10 @@ func sourceFromBlocks(_ blocks: [DocBlock], start index: Int, sectionOnly: Bool,
 }
 
 /// ⌘-click: read by structure at a screen point (top-left coordinates). Returns nil if there's nothing to read.
-func readSourceAt(_ p: CGPoint) -> ReadSource? {
-    var found: AXUIElement?
-    guard AXUIElementCopyElementAtPosition(systemWide, Float(p.x), Float(p.y), &found) == .success, let hit = found else { return nil }
-    AXUIElementSetMessagingTimeout(hit, 1.5)
+func readSourceAt(_ p: CGPoint, hitElement: AXUIElement? = nil) -> ReadSource? {
+    var found: AXUIElement? = hitElement
+    if found == nil { _ = AXUIElementCopyElementAtPosition(systemWide, Float(p.x), Float(p.y), &found) }
+    guard let hit = found else { return nil }
     let chain = ancestors(hit)
     let paragraphOnly = prefs.integer(forKey: Key.paragraphMode) == 1
 
@@ -1118,7 +1238,7 @@ func readSourceAt(_ p: CGPoint) -> ReadSource? {
     guard let web = chain.first(where: { axString($0, "AXRole") == "AXWebArea" }) else {
         // Native apps (for example a chat app's replies): read from the clicked paragraph onward.
         if let area = chain.first(where: { axString($0, "AXRole") == "AXScrollArea" }) {
-            let blocks = collectBlocks(area, from: blockStart(chain, within: area))
+            let blocks = collectBlocks(area, from: blockStart(chain, within: area), sectionOnly: true, paragraphOnly: paragraphOnly)
             if !blocks.isEmpty { return sourceFromBlocks(blocks, start: 0, sectionOnly: true, paragraphOnly: paragraphOnly) }
         }
         if let t = textAt(p) { return ReadSource(text: t.text, element: nil, base: 0) }
@@ -1144,7 +1264,7 @@ func readSourceAt(_ p: CGPoint) -> ReadSource? {
     // Every other page: start exactly where you clicked (a paragraph, a link, a video in a long list)
     // and keep going down the page from there.
     let root = chain.first(where: { isArticle($0) }) ?? web
-    let blocks = collectBlocks(root, from: blockStart(chain, within: root))
+    let blocks = collectBlocks(root, from: blockStart(chain, within: root), sectionOnly: true, paragraphOnly: paragraphOnly)
     if !blocks.isEmpty { return sourceFromBlocks(blocks, start: 0, sectionOnly: true, paragraphOnly: paragraphOnly) }
 
     // Last resort: the nearest bit of the page around the click that has words in it.
@@ -1216,7 +1336,7 @@ func expandSeeMore(_ post: AXUIElement) -> Bool {
         return false
     }
     func walk(_ e: AXUIElement, _ depth: Int) {
-        if pressed || visited > 4000 || depth > 60 { return }
+        if AXWork.current?.expired == true || pressed || visited > 4000 || depth > 60 { return }
         visited += 1
         let role = axString(e, "AXRole") ?? ""
         if ["AXButton", "AXLink", "AXStaticText"].contains(role), words.contains(label(e)) {
@@ -1316,7 +1436,7 @@ func collectText(_ root: AXUIElement) -> String {
     var parts: [String] = []
     var visited = 0
     func walk(_ e: AXUIElement, _ depth: Int) {
-        if visited > 8000 || depth > 70 { return }
+        if AXWork.current?.expired == true || visited > 8000 || depth > 70 { return }
         visited += 1
         let role = axString(e, "AXRole") ?? ""
         if role == "AXStaticText" || role == "AXTextArea" {
@@ -1353,7 +1473,7 @@ func ownWindowHit(_ cp: NSPoint) -> (inOwnWindow: Bool, textView: NSTextView?, i
 }
 
 /// Selected text: straight from accessibility, or by copying it as a fallback.
-func withSelectedText(_ done: @escaping (String?, AXUIElement?, Int) -> Void) {
+func withSelectedText(request: ReadRequest? = nil, _ done: @escaping (String?, AXUIElement?, Int) -> Void) {
     if NSApp.isActive {
         // Reader+ itself is in front (the tour's practice box, the reading window…)
         if let tv = NSApp.keyWindow?.firstResponder as? NSTextView, tv.selectedRange().length > 0 {
@@ -1361,20 +1481,39 @@ func withSelectedText(_ done: @escaping (String?, AXUIElement?, Int) -> Void) {
         } else { done(nil, nil, 0) }
         return
     }
-    frontAppElement()
-    if let f = focusedElement(), let s = axString(f, "AXSelectedText"), !s.trimmed.isEmpty {
-        let loc = axRangeValue(ax(f, "AXSelectedTextRange"))?.location ?? -1
-        done(s, loc >= 0 ? f : nil, max(loc, 0)); return
-    }
-    let pb = NSPasteboard.general
-    let before = pb.changeCount
-    let saved = pb.string(forType: .string)
-    postKey(CGKeyCode(kVK_ANSI_C), .maskCommand)
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-        guard pb.changeCount != before else { done(nil, nil, 0); return }
-        let s = pb.string(forType: .string)
-        if let saved = saved { pb.clearContents(); pb.setString(saved, forType: .string) }
-        done(s, nil, 0)
+    DispatchQueue.global(qos: .userInitiated).async {
+        let selection: (String, AXUIElement?, Int)? = AXWork.run(seconds: 0.6, valid: { request?.valid != false }) {
+            frontAppElement()
+            guard let f = focusedElement(), let s = axString(f, "AXSelectedText"), !s.trimmed.isEmpty else { return nil }
+            let loc = axRangeValue(ax(f, "AXSelectedTextRange"))?.location ?? -1
+            return (s, loc >= 0 ? f : nil, max(loc, 0))
+        }
+        DispatchQueue.main.async {
+            guard request?.valid != false else { return }
+            if let selection = selection { done(selection.0, selection.1, selection.2); return }
+            let pb = NSPasteboard.general
+            let before = pb.changeCount
+            // Preserve all clipboard formats, including images, when copying is needed as a fallback.
+            let saved = (pb.pasteboardItems ?? []).map { item in
+                item.types.compactMap { type -> (NSPasteboard.PasteboardType, Data)? in
+                    guard let data = item.data(forType: type) else { return nil }; return (type, data)
+                }
+            }
+            postKey(CGKeyCode(kVK_ANSI_C), .maskCommand)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                guard pb.changeCount != before else { if request?.valid != false { done(nil, nil, 0) }; return }
+                let s = pb.string(forType: .string)
+                pb.clearContents()
+                let items = saved.map { values -> NSPasteboardItem in
+                    let item = NSPasteboardItem()
+                    for (type, data) in values { item.setData(data, forType: type) }
+                    return item
+                }
+                pb.writeObjects(items)
+                guard request?.valid != false else { return }
+                done(s, nil, 0)
+            }
+        }
     }
 }
 
@@ -1575,13 +1714,20 @@ final class Reading {
     var offset = 0          // where the current utterance starts inside source.text
     var lastWord = NSRange(location: 0, length: 0)
     var currentBlock = -1
+    var generation = 0
 
     init() {
         Speaker.shared.onWord = { [weak self] r in self?.word(r) }
-        Speaker.shared.onDone = { ReaderWindow.shared.setPlaying(false); Overlay.shared.hide() }
+        Speaker.shared.onDone = {
+            ReaderWindow.shared.setPlaying(false); Overlay.shared.hide()
+            if ReaderModel.shared.activity == "Reading" { ReaderModel.shared.activity = "Finished" }
+        }
     }
 
-    func start(_ src: ReadSource, from: Int = 0, showWindow: Bool = true) {
+    func start(_ src: ReadSource, from: Int = 0, showWindow: Bool = true, request: ReadRequest? = nil) {
+        ClickReader.shared.cancelPending()
+        generation += 1
+        Speaker.shared.request = request
         source = src
         let ns = src.text as NSString
         offset = max(0, min(from, ns.length))
@@ -1603,8 +1749,15 @@ final class Reading {
             let para = ns.paragraphRange(for: NSRange(location: full.location, length: 0))
             if para.location != lastParagraph {
                 lastParagraph = para.location
-                if let rect = axRectValue(axParam(e, "AXBoundsForRange", makeRange(src.base + para.location, max(1, para.length)))) {
-                    Overlay.shared.show(axRect: rect)
+                let token = generation
+                DispatchQueue.global(qos: .utility).async {
+                    let rect = AXWork.run(seconds: 0.2) {
+                        axRectValue(axParam(e, "AXBoundsForRange", makeRange(src.base + para.location, max(1, para.length))))
+                    }
+                    DispatchQueue.main.async {
+                        guard token == self.generation, Speaker.shared.isReading, let rect = rect else { return }
+                        Overlay.shared.show(axRect: rect)
+                    }
                 }
             }
         } else if let bi = blockIndex(at: full.location) {
@@ -1612,13 +1765,15 @@ final class Reading {
                 // A new paragraph: bring it on screen and learn its size and line height.
                 currentBlock = bi; blockFrame = nil; lastLine = -1
                 let el = src.blocks[bi].element
+                let token = generation
                 DispatchQueue.global(qos: .userInitiated).async {
+                    AXUIElementSetMessagingTimeout(el, 0.12)
                     AXUIElementPerformAction(el, "AXScrollToVisible" as CFString)
                     usleep(120_000)
                     let f = axFrame(el)
                     let lh = lineHeight(in: el)
                     DispatchQueue.main.async {
-                        guard self.currentBlock == bi, let f = f else { return }
+                        guard self.generation == token, Speaker.shared.isReading, self.currentBlock == bi, let f = f else { return }
                         self.blockFrame = f; self.blockLineHeight = lh
                         self.followLine(self.lastWord)
                     }
@@ -1644,11 +1799,11 @@ final class Reading {
         // If the page was scrolled, move the outline with the paragraph (checked twice a second).
         guard Date().timeIntervalSince(lastFrameCheck) > 0.5 else { return }
         lastFrameCheck = Date()
-        let el = src.blocks[currentBlock].element, bi = currentBlock
+        let el = src.blocks[currentBlock].element, bi = currentBlock, token = generation
         DispatchQueue.global(qos: .utility).async {
             if let nf = axFrame(el), nf != f {
                 DispatchQueue.main.async {
-                    if self.currentBlock == bi { self.blockFrame = nf; Overlay.shared.show(axRect: nf) }
+                    if token == self.generation && Speaker.shared.isReading && self.currentBlock == bi { self.blockFrame = nf; Overlay.shared.show(axRect: nf) }
                 }
             }
         }
@@ -1713,12 +1868,14 @@ final class MouseEcho {
         if Speaker.shared.isReading { return }
         if NSApp.windows.contains(where: { $0.isVisible && $0 !== Overlay.shared.win && $0.frame.contains(p) }) { return }
         busy = true
-        let q = axPoint(p)
+        let q = axPoint(p), token = Reading.shared.generation
         DispatchQueue.global(qos: .userInitiated).async {
             let found = textAt(q)
             DispatchQueue.main.async {
                 self.busy = false
-                guard let f = found else { return }
+                guard prefs.bool(forKey: Key.mouseEcho), !Speaker.shared.isReading,
+                      !ClickReader.shared.hasPending, token == Reading.shared.generation,
+                      NSEvent.mouseLocation == p, let f = found else { return }
                 self.lastText = f.text
                 say(f.text)
                 if let r = f.frame { Overlay.shared.show(axRect: r, for: 1.6) }
@@ -1770,7 +1927,7 @@ final class KeyEcho {
             controlAlone = false
             // Only a quick tap stops speech. Holding Control (to zoom with the magnifier) doesn't.
             // A quick tap only (holding Control to zoom doesn't count), and only if that setting is on.
-            if Date().timeIntervalSince(controlDownAt) < 0.35 && !prefs.bool(forKey: "noControlStop") && Speaker.shared.isSpeaking {
+            if Date().timeIntervalSince(controlDownAt) < 0.35 && !prefs.bool(forKey: "noControlStop") && (Speaker.shared.isReading || Speaker.shared.isSpeaking || ClickReader.shared.hasPending) {
                 Speaker.shared.stop(); Overlay.shared.hide(); log("stopped by tapping Control")
             }
         } else { controlAlone = false }
@@ -1879,20 +2036,36 @@ func recognizeText(_ img: CGImage, _ done: @escaping (String) -> Void) {
 }
 
 /// Reads the words found in an area of the screen. `fallback` is used if no words are found (e.g. an image description).
-func ocrRead(_ rect: CGRect, fallback: String? = nil, showWindow: Bool = true) {
+func ocrRead(_ rect: CGRect, fallback: String? = nil, showWindow: Bool = true, request: ReadRequest? = nil) {
     guard #available(macOS 14.0, *) else { say("Reading text in pictures needs macOS 14 or later."); return }
     guard hasScreenRecording else { askForScreenRecording(); return }
     Overlay.shared.show(axRect: rect, for: 1.2)
+    request?.trace("OCR started")
     captureScreen(rect) { img in
-        guard let img = img else { DispatchQueue.main.async { say("I couldn't look at the screen there.") }; return }
+        guard request?.valid != false else { return }
+        guard let img = img else {
+            DispatchQueue.main.async {
+                guard request?.valid != false else { return }
+                if request != nil { ClickReader.shared.cancelPending() }
+                ReaderModel.shared.activity = "Could not capture that part of the screen."
+                say("I couldn't look at the screen there.")
+            }
+            return
+        }
         recognizeText(img) { text in
             DispatchQueue.main.async {
+                guard request?.valid != false else { return }
                 if !text.trimmed.isEmpty {
                     log("OCR read \(text.count) characters")
-                    Reading.shared.start(ReadSource(text: text, element: nil, base: 0), showWindow: showWindow)
+                    let src = ReadSource(text: text, element: nil, base: 0)
+                    if let r = request { ClickReader.shared.deliver(src, request: r, showWindow: showWindow) }
+                    else { Reading.shared.start(src, showWindow: showWindow) }
                 } else if let f = fallback, !f.trimmed.isEmpty {
-                    say(f)
+                    if let r = request { ClickReader.shared.deliver(ReadSource(text: f, element: nil, base: 0), request: r, showWindow: showWindow) }
+                    else { say(f) }
                 } else {
+                    if request != nil { ClickReader.shared.cancelPending() }
+                    ReaderModel.shared.activity = "No words found in that part of the screen."
                     say("I couldn't find any words there.")
                 }
             }
@@ -1923,11 +2096,93 @@ final class ClickReader {
     var swallowRightUp = false
     var swallowOtherUp = false
     var lastScroll = Date.distantPast
+    private var serial = 0
+    private var pending: ReadRequest?
+    var hasPending: Bool { pending?.valid == true }
+    static let replayMarker: Int64 = 0x52504C5553
+    final class CapturedClick {
+        let down: CGEvent
+        var up: CGEvent?
+        var pass = false
+        init(_ event: CGEvent) { down = event.copy()! }
+    }
+    private var heldClick: CapturedClick?
+
+    func cancelPending() { pending?.cancel(); pending = nil }
+    private func makeRequest() -> ReadRequest {
+        cancelPending(); serial += 1
+        let r = ReadRequest(serial); pending = r
+        return r
+    }
+    func begin() -> ReadRequest {
+        let r = makeRequest()
+        prepare(r)
+        return r
+    }
+    private func prepare(_ r: ReadRequest) {
+        guard r.valid else { return }
+        pending = nil
+        Speaker.shared.stop()
+        pending = r
+        ReaderModel.shared.activity = "Getting text…"
+        r.trace("click received")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            guard self.pending === r, r.valid else { return }
+            ReaderModel.shared.activity = "Waiting for the app to provide text…"
+            r.trace("waiting for app text")
+        }
+    }
+    private func replay(_ event: CGEvent) {
+        event.setIntegerValueField(.eventSourceUserData, value: Self.replayMarker)
+        event.post(tap: .cgSessionEventTap)
+    }
+    func capture(_ event: CGEvent) {
+        let click = CapturedClick(event), point = event.location
+        heldClick = click
+        let r = makeRequest()
+        // Return to the event tap before stopping speech, logging, or contacting another app.
+        DispatchQueue.main.async {
+          guard r.valid else { return }
+          self.prepare(r)
+          DispatchQueue.global(qos: .userInitiated).async {
+            let use = AXWork.run(seconds: 0.35) { clickUse(point) }
+            r.trace("click classified")
+            DispatchQueue.main.async {
+                if use == .readAndPass || use == .ignore {
+                    click.pass = true
+                    self.replay(click.down)
+                    if let up = click.up { self.replay(up) }
+                }
+                guard r.valid else { return }
+                self.read(at: point, request: r)
+            }
+          }
+        }
+    }
+    func release(_ event: CGEvent) -> Bool {
+        guard let click = heldClick else { return false }
+        heldClick = nil
+        if click.pass { replay(event.copy()!) } else { click.up = event.copy() }
+        return true
+    }
+    func deliver(_ src: ReadSource?, request r: ReadRequest, showWindow: Bool) {
+        guard r.valid else { return }
+        pending = nil
+        guard let s = src, !s.text.trimmed.isEmpty else {
+            ReaderModel.shared.activity = "No readable text found here."
+            r.trace("no readable text")
+            return
+        }
+        r.trace("text ready (\(s.text.count) characters)")
+        Reading.shared.start(s, showWindow: showWindow, request: r)
+    }
 
     /// ⌘-right-click: read the whole page or window under the pointer, from the top.
     func readPage(at p: CGPoint) {
         let showWindow = prefs.bool(forKey: Key.clickShowsReader)
+        let request = begin()
         DispatchQueue.global(qos: .userInitiated).async {
+          AXWork.run(seconds: 3, valid: { request.valid }) {
             var root: AXUIElement? = nil
             var hit: AXUIElement?
             if AXUIElementCopyElementAtPosition(systemWide, Float(p.x), Float(p.y), &hit) == .success, let h = hit {
@@ -1941,11 +2196,14 @@ final class ClickReader {
                 if !blocks.isEmpty { src = sourceFromBlocks(blocks, start: 0, sectionOnly: false, paragraphOnly: false) }
                 else { let t = collectText(r); if !t.trimmed.isEmpty { src = ReadSource(text: t, element: nil, base: 0) } }
             }
+            if AXWork.current?.expired == true { src = nil; request.trace("whole-page lookup timed out; using visible-screen OCR") }
             DispatchQueue.main.async {
-                if let s = src, !s.text.trimmed.isEmpty { Reading.shared.start(s, showWindow: showWindow); return }
-                if let w = windowFrame(at: p) { ocrRead(w, showWindow: showWindow) }
-                else { ocrRead(CGRect(x: p.x - 450, y: p.y - 250, width: 900, height: 500), showWindow: showWindow) }
+                guard request.valid else { return }
+                if src != nil { self.deliver(src, request: request, showWindow: showWindow); return }
+                let rect = windowFrame(at: p) ?? CGRect(x: p.x - 450, y: p.y - 250, width: 900, height: 500)
+                ocrRead(rect, showWindow: showWindow, request: request)
             }
+          }
         }
     }
 
@@ -1973,39 +2231,61 @@ final class ClickReader {
         return mode == 2 ? f.contains(.maskAlternate) : !f.contains(.maskAlternate)
     }
 
-    func read(at p: CGPoint) {
+    func read(at p: CGPoint, request: ReadRequest? = nil) {
+        let r = request ?? begin()
         let showWindow = prefs.bool(forKey: Key.clickShowsReader)
         DispatchQueue.global(qos: .userInitiated).async {
-            // Pictures: read the words in them.
+            guard r.valid else { return }
             var hit: AXUIElement?
-            if AXUIElementCopyElementAtPosition(systemWide, Float(p.x), Float(p.y), &hit) == .success, let h = hit {
-                AXUIElementSetMessagingTimeout(h, 1.0)
+            _ = AXUIElementCopyElementAtPosition(systemWide, Float(p.x), Float(p.y), &hit)
+            guard r.valid else { return }
+            let image: (CGRect, String?)? = AXWork.run(seconds: 0.25, valid: { r.valid }) {
+                guard let h = hit else { return nil }
                 let up = ancestors(h, max: 6)
-                let img = up.prefix(4).first(where: { axString($0, "AXRole") == "AXImage" })
+                guard let im = up.prefix(4).first(where: { axString($0, "AXRole") == "AXImage" }),
+                      let f = axFrame(im), f.width >= 24, f.height >= 24 else { return nil }
                 let link = up.first(where: { axString($0, "AXRole") == "AXLink" })
-                let linkWords = link.map { collectText($0).trimmed } ?? ""
-                if let im = img, linkWords.count < 3, let f = axFrame(im), f.width >= 24, f.height >= 24 {
-                    let desc = axString(im, "AXDescription") ?? axString(im, "AXTitle")
-                    DispatchQueue.main.async { ocrRead(f, fallback: desc.map { "Image: \($0)" }, showWindow: showWindow) }
+                if let link = link, collectText(link).trimmed.count >= 3 { return nil }
+                return (f, axString(im, "AXDescription") ?? axString(im, "AXTitle"))
+            }
+            r.trace("hit and image check complete")
+            if let image = image {
+                DispatchQueue.main.async {
+                    guard r.valid else { return }
+                    ocrRead(image.0, fallback: image.1, showWindow: showWindow, request: r)
+                }
+                return
+            }
+            var timedOut = false
+            let src = AXWork.run(seconds: 3.0, valid: { r.valid }) {
+                let result = readSourceAt(p, hitElement: hit)
+                timedOut = AXWork.current?.expired == true
+                let work = AXWork.current!
+                r.trace("text lookup (\(work.calls) queries, \(work.timeouts) timeouts)")
+                return result
+            }
+            r.trace("structure complete")
+            DispatchQueue.main.async {
+                guard r.valid else { return }
+                if timedOut {
+                    self.pending = nil
+                    r.trace("text lookup deadline exceeded; incomplete text discarded")
+                    ReaderModel.shared.activity = "The app did not provide its text in time."
+                    say("That app is taking too long to provide its text. Please try again.")
                     return
                 }
-            }
-            let t0 = Date()
-            let src = readSourceAt(p)
-            let app = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
-            log(String(format: "click in %@: %d blocks, %d chars, %.1fs, starts \"%@\"", app, src?.blocks.count ?? 0,
-                       (src?.text ?? "").count, Date().timeIntervalSince(t0), String((src?.text ?? "nothing").prefix(40))))
-            DispatchQueue.main.async {
-                if let s = src, !s.text.trimmed.isEmpty { Reading.shared.start(s, showWindow: showWindow); return }
-                // Nothing in the page's text there — look at the screen instead.
-                ocrRead(CGRect(x: p.x - 450, y: p.y - 140, width: 900, height: 280), showWindow: showWindow)
+                if let s = src, !s.text.trimmed.isEmpty { self.deliver(s, request: r, showWindow: showWindow); return }
+                ocrRead(CGRect(x: p.x - 450, y: p.y - 140, width: 900, height: 280), showWindow: showWindow, request: r)
             }
         }
     }
+
 }
 
 let clickTapCallback: CGEventTapCallBack = { _, type, event, _ in
+    if event.getIntegerValueField(.eventSourceUserData) == ClickReader.replayMarker { return Unmanaged.passUnretained(event) }
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+        log("click event listener re-enabled after timeout or user input")
         if let t = ClickReader.shared.tap { CGEvent.tapEnable(tap: t, enable: true) }
         return Unmanaged.passUnretained(event)
     }
@@ -2042,18 +2322,10 @@ let clickTapCallback: CGEventTapCallBack = { _, type, event, _ in
             }
             return nil
         }
-        switch clickUse(p) {
-        case .read:
-            ClickReader.shared.swallowUp = true
-            ClickReader.shared.read(at: p)
-            return nil // the click is used for reading, so the page doesn't get it
-        case .readAndPass:
-            ClickReader.shared.read(at: p)
-            return Unmanaged.passUnretained(event)
-        case .ignore:
-            break
-        }
+        ClickReader.shared.capture(event)
+        return nil
     }
+    if type == .leftMouseUp && ClickReader.shared.release(event) { return nil }
     if type == .leftMouseUp && ClickReader.shared.swallowUp {
         ClickReader.shared.swallowUp = false
         return nil
@@ -2063,7 +2335,7 @@ let clickTapCallback: CGEventTapCallBack = { _, type, event, _ in
     // ⌘-right-click: stop while talking, otherwise read the whole page or window.
     if type == .rightMouseDown, ClickReader.modifiersMatch(event.flags) {
         let p = event.location
-        if talking || Speaker.shared.isSpeaking {
+        if talking || Speaker.shared.isSpeaking || cr.hasPending {
             cr.swallowRightUp = true
             DispatchQueue.main.async {
                 Speaker.shared.stop()
@@ -2075,7 +2347,7 @@ let clickTapCallback: CGEventTapCallBack = { _, type, event, _ in
         }
         if !ownWindowHit(NSPoint(x: p.x, y: primaryHeight - p.y)).inOwnWindow {
             cr.swallowRightUp = true
-            cr.readPage(at: p)
+            DispatchQueue.main.async { cr.readPage(at: p) }
             return nil
         }
     }
@@ -2479,6 +2751,7 @@ var appDel: AppDelegate { NSApp.delegate as! AppDelegate }
 final class ReaderModel: ObservableObject {
     static let shared = ReaderModel()
     @Published var tick = 0
+    @Published var activity = "Ready"
     private var timer: Timer?
     func startTicking() {
         guard timer == nil else { return }
@@ -2594,6 +2867,7 @@ struct GeneralPane: View {
     var body: some View {
         Form {
             Section {
+                Text(model.activity).accessibilityLabel("Reading status: " + model.activity)
                 HStack(spacing: 14) {
                     Image(nsImage: NSApp.applicationIconImage ?? NSImage()).resizable().frame(width: 64, height: 64)
                     VStack(alignment: .leading, spacing: 3) {
@@ -2980,7 +3254,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         registerDefaults()
-        AXUIElementSetMessagingTimeout(systemWide, 0.6)
+        AXUIElementSetMessagingTimeout(systemWide, 0.12)
         _ = Reading.shared
         _ = PreviousApp.shared
         buildMenu()
@@ -3064,9 +3338,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func readSelection() {
         if needTrust() { return }
-        withSelectedText { text, el, base in
-            guard let t = text, !t.trimmed.isEmpty else { say("No text is selected."); return }
-            Reading.shared.start(ReadSource(text: t, element: el, base: base))
+        let request = ClickReader.shared.begin()
+        withSelectedText(request: request) { text, el, base in
+            guard request.valid else { return }
+            guard let t = text, !t.trimmed.isEmpty else {
+                ClickReader.shared.cancelPending()
+                ReaderModel.shared.activity = "No text is selected."
+                say("No text is selected."); return
+            }
+            ClickReader.shared.deliver(ReadSource(text: t, element: el, base: base), request: request, showWindow: true)
         }
     }
 
@@ -3079,19 +3359,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         if needTrust() { return }
+        let request = ClickReader.shared.begin()
         DispatchQueue.global(qos: .userInitiated).async {
-            let src = readSourceFromFocus()
+            var expired = false
+            let src = AXWork.run(seconds: 3, valid: { request.valid }) {
+                let result = readSourceFromFocus()
+                expired = AXWork.current?.expired == true
+                return result
+            }
             DispatchQueue.main.async {
-                guard let s = src else { say("I couldn't find any text to read here."); return }
-                Reading.shared.start(s)
+                guard request.valid else { return }
+                if expired {
+                    ClickReader.shared.cancelPending()
+                    ReaderModel.shared.activity = "The app did not provide its text in time."
+                    request.trace("focused text lookup timed out")
+                    say("That app is taking too long to provide its text. Please try again.")
+                    return
+                }
+                ClickReader.shared.deliver(src, request: request, showWindow: true)
             }
         }
     }
 
     @objc func readScreenUnderPointer() {
-        let p = axPoint(NSEvent.mouseLocation)
-        if let r = windowFrame(at: p) { ocrRead(r) }
-        else { ocrRead(CGRect(x: p.x - 450, y: p.y - 250, width: 900, height: 500)) }
+        let p = axPoint(NSEvent.mouseLocation), request = ClickReader.shared.begin()
+        if let r = windowFrame(at: p) { ocrRead(r, request: request) }
+        else { ocrRead(CGRect(x: p.x - 450, y: p.y - 250, width: 900, height: 500), request: request) }
     }
 
     @objc func readClipboard() {
