@@ -1,22 +1,18 @@
 // Reader+ — a ZoomText-style screen reader for the Mac, without the magnifier.
 // Speaks with the Mac's own voices (the same ones VoiceOver uses) without turning VoiceOver on.
 //
-//   Control-Option-S   Read selected text
-//   Control-Option-R   Read from the cursor, or the whole window / web page (AppReader)
-//   Control-Option-V   Read the clipboard
-//   Control-Option-P   Pause / resume
-//   Control (tap)      Stop talking            (also Control-Option-X)
-//   Control-Option-M   Mouse Echo on/off — reads what the pointer rests on
-//   Control-Option-K   Key Echo: off → characters → words → both
-//   Control-Option-=   Faster          Control-Option-minus   Slower
-//   Control-Option-W   Show / hide the reading window
-//   Control-Option-H   Spoken help
-//   Control-Option-T   Guided tour
-//   Control-Option-O   Read the text in the window under the pointer with OCR (pictures, scans)
-//   ⌘-click an image   Reads the words in the picture (OCR)
-//   ⌘-click            Read by structure: a heading reads its whole section; a paragraph reads the
-//                      article from there (or just that paragraph — your choice in the menu)
-//   Control-Option-←/→ Previous / next paragraph      Control-Option-↑/↓  Previous / next heading
+//   Reader+ is a mouse-first app. No keyboard shortcuts to learn; people who want lots of
+//   commands can use VoiceOver. Everything below uses the Command key and the mouse:
+//
+//   ⌘-click                Read by structure: a heading reads its whole section; a paragraph reads the
+//                          article from there (or just that paragraph). A social media post is read in full,
+//                          and a picture has its words read (OCR).
+//   ⌘-right-click          Read the whole page or window under the pointer (OCR if it has no real text).
+//                          While Reader+ is talking, it pauses and resumes instead.
+//   ⌘ + Back / Forward     Previous / next paragraph (the side buttons on a mouse), while reading.
+//   ⌘ + scroll wheel       Faster (up) / slower (down), while reading.
+//   Tap Control            Stop talking, like VoiceOver.
+//   Everything else is in the Reader+ window and the menu bar icon.
 
 import AppKit
 import AVFoundation
@@ -696,7 +692,7 @@ final class ReaderWindow: NSObject, NSWindowDelegate {
     func toggle() {
         if isVisible { window?.orderOut(nil) }
         else {
-            if window == nil { build(); show("Select text and press Control Option S, or press Control Option R to read the window you're in.") ; setPlaying(false) }
+            if window == nil { build(); show("Hold Command and click text to read it, or Command right-click to read the whole page.") ; setPlaying(false) }
             window?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
         }
     }
@@ -1043,11 +1039,42 @@ final class ClickReader {
     static let shared = ClickReader()
     var tap: CFMachPort?
     var swallowUp = false
+    var swallowRightUp = false
+    var swallowOtherUp = false
+    var lastScroll = Date.distantPast
+
+    /// ⌘-right-click: read the whole page or window under the pointer, from the top.
+    func readPage(at p: CGPoint) {
+        let showWindow = prefs.bool(forKey: Key.clickShowsReader)
+        DispatchQueue.global(qos: .userInitiated).async {
+            var root: AXUIElement? = nil
+            var hit: AXUIElement?
+            if AXUIElementCopyElementAtPosition(systemWide, Float(p.x), Float(p.y), &hit) == .success, let h = hit {
+                AXUIElementSetMessagingTimeout(h, 1.5)
+                root = ancestors(h, max: 80).first(where: { axString($0, "AXRole") == "AXWebArea" })
+                    ?? ancestors(h, max: 80).first(where: { axString($0, "AXRole") == "AXWindow" })
+            }
+            var src: ReadSource? = nil
+            if let r = root {
+                let blocks = collectBlocks(r)
+                if !blocks.isEmpty { src = sourceFromBlocks(blocks, start: 0, sectionOnly: false, paragraphOnly: false) }
+                else { let t = collectText(r); if !t.trimmed.isEmpty { src = ReadSource(text: t, element: nil, base: 0) } }
+            }
+            DispatchQueue.main.async {
+                if let s = src, !s.text.trimmed.isEmpty { Reading.shared.start(s, showWindow: showWindow); return }
+                if let w = windowFrame(at: p) { ocrRead(w, showWindow: showWindow) }
+                else { ocrRead(CGRect(x: p.x - 450, y: p.y - 250, width: 900, height: 500), showWindow: showWindow) }
+            }
+        }
+    }
 
     func start() {
         guard tap == nil, AXIsProcessTrusted() else { return }
-        let mask = (1 << CGEventType.leftMouseDown.rawValue) | (1 << CGEventType.leftMouseUp.rawValue)
-            | (1 << CGEventType.flagsChanged.rawValue) | (1 << CGEventType.keyDown.rawValue)
+        var mask: UInt64 = 0
+        for t: CGEventType in [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
+                               .otherMouseDown, .otherMouseUp, .scrollWheel, .flagsChanged, .keyDown] {
+            mask |= 1 << UInt64(t.rawValue)
+        }
         guard let t = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
                                         eventsOfInterest: CGEventMask(mask), callback: clickTapCallback, userInfo: nil) else {
             log("click tap not available"); return
@@ -1132,10 +1159,50 @@ let clickTapCallback: CGEventTapCallBack = { _, type, event, _ in
         ClickReader.shared.swallowUp = false
         return nil
     }
+    let cr = ClickReader.shared
+    let talking = Speaker.shared.isReading
+    // ⌘-right-click: pause / resume while talking, otherwise read the whole page or window.
+    if type == .rightMouseDown, ClickReader.modifiersMatch(event.flags) {
+        let p = event.location
+        if talking {
+            cr.swallowRightUp = true
+            DispatchQueue.main.async {
+                Speaker.shared.pauseOrResume()
+                ReaderWindow.shared.setPlaying(!Speaker.shared.isPaused && Speaker.shared.isReading)
+            }
+            return nil
+        }
+        if !ownWindowHit(NSPoint(x: p.x, y: primaryHeight - p.y)).inOwnWindow {
+            cr.swallowRightUp = true
+            cr.readPage(at: p)
+            return nil
+        }
+    }
+    if type == .rightMouseUp && cr.swallowRightUp { cr.swallowRightUp = false; return nil }
+    // ⌘ + the mouse's Back / Forward side buttons: previous / next paragraph while reading.
+    if type == .otherMouseDown, talking, ClickReader.modifiersMatch(event.flags) {
+        let button = event.getIntegerValueField(.mouseEventButtonNumber)
+        if button == 3 || button == 4 {
+            cr.swallowOtherUp = true
+            DispatchQueue.main.async { Reading.shared.jump(button == 4 ? 1 : -1, headingsOnly: false) }
+            return nil
+        }
+    }
+    if type == .otherMouseUp && cr.swallowOtherUp { cr.swallowOtherUp = false; return nil }
+    // ⌘ + scroll wheel: faster (up) / slower (down) while reading.
+    if type == .scrollWheel, talking, ClickReader.modifiersMatch(event.flags) {
+        let dy = event.getIntegerValueField(.scrollWheelEventDeltaAxis1)
+        let momentum = event.getIntegerValueField(.scrollWheelEventMomentumPhase)
+        if dy != 0 && momentum == 0 && Date().timeIntervalSince(cr.lastScroll) > 0.35 {
+            cr.lastScroll = Date()
+            DispatchQueue.main.async { Reading.shared.changeRate(dy > 0 ? 0.05 : -0.05) }
+        }
+        return nil
+    }
     return Unmanaged.passUnretained(event)
 }
 
-// MARK: - Global hotkeys (Control-Option-…)
+// MARK: - Global hotkeys (not used: Reader+ is mouse-first)
 
 var hotKeyActions: [UInt32: () -> Void] = [:]
 var hotKeyRefs: [EventHotKeyRef] = []
@@ -1175,41 +1242,33 @@ struct Slide {
 
 let slides: [Slide] = [
     Slide(symbol: "text.bubble.fill", color: rgb(0.96, 0.45, 0.15), title: "Welcome to Reader+",
-          body: "Reader+ reads your screen out loud using the Mac's own voices, the same ones VoiceOver uses, without turning VoiceOver on. Your magnifier stays exactly as it is. Reader+ just adds speech.\n\nPress Return or click Next to go on. Press the Left arrow or click Back to go back."),
-    Slide(symbol: "lock.open.fill", color: rgb(0.2, 0.7, 0.35), title: "Two permissions, and why",
-          body: "macOS keeps apps from reading other apps' text unless you allow it.\n\nAccessibility lets Reader+ see the words in Safari, Chrome, Mail and your other apps. Input Monitoring lets Key Echo hear your typing. Screen Recording lets Reader+ read the words in pictures.",
+          body: "Reader+ reads your screen out loud using the Mac's own voices, the same ones VoiceOver uses, without turning VoiceOver on. Your magnifier stays exactly as it is. Reader+ just adds speech.\n\nThere are no keyboard shortcuts to learn. You hold the Command key and use your mouse.\n\nPress Return or click Next to go on."),
+    Slide(symbol: "lock.open.fill", color: rgb(0.2, 0.7, 0.35), title: "Permissions, and why",
+          body: "macOS keeps apps from reading other apps' text unless you allow it.\n\nAccessibility lets Reader+ see the words in Safari, Chrome, Mail and your other apps, and notice your Command-clicks. Screen Recording lets Reader+ read the words in pictures. Input Monitoring is only needed for Key Echo.",
           permissions: true),
-    Slide(symbol: "text.cursor", color: rgb(0.2, 0.5, 1), title: "Read what you select",
-          body: "Select text in any app, then press Control Option S. Reader+ reads it in the reading window and outlines each word on screen as it goes.\n\nIt asks the app for your selection directly. If an app won't share it, Reader+ copies it quietly and then puts your clipboard back the way it was.",
-          keys: ["⌃ Control", "⌥ Option", "S"], spokenKeys: "Control Option S",
-          practice: "Try it now. Select this sentence with your mouse, then press Control Option S."),
-    Slide(symbol: "list.bullet.indent", color: rgb(0.6, 0.35, 0.95), title: "⌘-click to read by headings and paragraphs",
+    Slide(symbol: "list.bullet.indent", color: rgb(0.6, 0.35, 0.95), title: "⌘-click to read",
           body: "Hold Command and click a heading to hear that heading and everything under it, up to the next heading. Command-click a paragraph to hear the article from there to the end.\n\nThis works because web pages label their headings and paragraphs for accessibility, so Reader+ can follow an article the way it was written. Command-clicking a link still opens it as usual.",
           keys: ["⌘ Command", "Click"], spokenKeys: "Command click",
           practice: "Try it. Hold Command and click this paragraph. Reader+ reads from here to the end of this box.\n\nThis is the second paragraph. Reading carries on into it by itself.\n\nAnd here's a third paragraph, so you can hear it keep going."),
-    Slide(symbol: "text.viewfinder", color: rgb(0.15, 0.6, 0.95), title: "Read words in pictures",
-          body: "Command-click a picture, like a screenshot, a meme or a scanned page, and Reader+ reads the words in it. It uses the text recognition built into your Mac, so nothing leaves your computer.\n\nTo read everything in the window under your pointer, even in apps with no real text, press Control Option O. This needs Screen Recording permission, so Reader+ can look at the screen.",
-          keys: ["⌃ Control", "⌥ Option", "O"], spokenKeys: "Control Option O"),
     Slide(symbol: "bubble.left.and.text.bubble.right.fill", color: rgb(0.25, 0.45, 0.95), title: "Whole posts on social media",
-          body: "On Facebook, Instagram, X, Threads, LinkedIn, Reddit and similar sites, Command-click a post and Reader+ reads the whole post. It presses See more for you, so you don't have to find it.\n\nIt skips buttons like Like, Comment and Share, so you only hear what people wrote. Clicks read aloud without opening the reading window.",
+          body: "On Facebook, Instagram, X, Threads, LinkedIn, Reddit and similar sites, Command-click a post and Reader+ reads the whole post. It presses See more for you, so you don't have to find it.\n\nIt skips buttons like Like, Comment and Share, so you only hear what people wrote.",
+          keys: ["⌘ Command", "Click"], spokenKeys: "Command click"),
+    Slide(symbol: "text.viewfinder", color: rgb(0.15, 0.6, 0.95), title: "Words in pictures",
+          body: "Command-click a picture, like a screenshot, a meme or a scanned page, and Reader+ reads the words in it. It uses the text recognition built into your Mac, so nothing leaves your computer.",
           keys: ["⌘ Command", "Click"], spokenKeys: "Command click"),
     Slide(symbol: "doc.text.magnifyingglass", color: rgb(0.1, 0.65, 0.7), title: "Read a whole page",
-          body: "Press Control Option R to read from where your cursor is, or the whole page if there's no cursor.\n\nWhile it reads, press Control Option with the Right or Left arrow to jump to the next or previous paragraph. Use the Up and Down arrows to jump between headings, so you can skip to the part you want.",
-          keys: ["⌃ Control", "⌥ Option", "R"], spokenKeys: "Control Option R"),
-    Slide(symbol: "textformat.size", color: rgb(0.95, 0.75, 0.1), title: "The reading window",
-          body: "Long text opens in a big, high-contrast reading window. The word being spoken is highlighted, and the window scrolls along with it.\n\nUse A+ and A− to change the size, Colors to switch between five color schemes, and Slower or Faster to change the speed. To start from a certain spot, click there in the text and press Read.",
-          keys: ["⌃ Control", "⌥ Option", "W"], spokenKeys: "Control Option W"),
-    Slide(symbol: "cursorarrow.rays", color: rgb(0.95, 0.3, 0.55), title: "Mouse Echo",
-          body: "Turn on Mouse Echo, then rest the pointer on a button, menu, link or line of text. After a short pause, Reader+ says what it is, like \"Save, button\".\n\nIt waits for the pointer to stop, so it doesn't talk while you're still moving. You can change how long it waits under Mouse Echo Delay in the Reader+ menu.",
-          keys: ["⌃ Control", "⌥ Option", "M"], spokenKeys: "Control Option M"),
-    Slide(symbol: "keyboard", color: rgb(0.35, 0.4, 0.95), title: "Key Echo",
-          body: "Key Echo says what you type. Press Control Option K to switch between Off, Characters, Words, and both.\n\nWords are spoken when you press space or a punctuation mark, so you hear whole words without hearing every letter.",
-          keys: ["⌃ Control", "⌥ Option", "K"], spokenKeys: "Control Option K"),
-    Slide(symbol: "speaker.wave.3.fill", color: rgb(0.96, 0.45, 0.15), title: "Stop, speed and voice",
-          body: "To stop talking, just tap the Control key by itself, exactly like VoiceOver. Control Option Equals and Minus make it faster or slower, even in the middle of a sentence.\n\nYou can pick a voice from the Reader+ menu. Enhanced and Premium voices sound the most natural, and you can download more with Get More Voices.",
+          body: "Hold Command and right-click anywhere on a page or window to hear all of it from the top. If it has no real text, Reader+ reads the words it sees on the screen instead.\n\nWhile Reader+ is talking, Command right-click pauses, and doing it again carries on.",
+          keys: ["⌘ Command", "Right-click"], spokenKeys: "Command right-click"),
+    Slide(symbol: "computermouse.fill", color: rgb(0.6, 0.35, 0.95), title: "Move and change speed",
+          body: "While Reader+ is reading, hold Command and press the Back button on the side of your mouse to go to the previous paragraph, or Forward for the next one.\n\nHold Command and scroll up to read faster, or down to read slower.",
+          keys: ["⌘ Command", "Side buttons or scroll"], spokenKeys: "Command with the mouse side buttons or the scroll wheel"),
+    Slide(symbol: "speaker.slash.fill", color: rgb(0.96, 0.45, 0.15), title: "Stop talking",
+          body: "To stop talking, just tap the Control key by itself, exactly like VoiceOver.\n\nYou can pick a voice in the Reader+ window. Enhanced and Premium voices sound the most natural.",
           keys: ["⌃ Control"], spokenKeys: "Control"),
-    Slide(symbol: "checkmark.seal.fill", color: rgb(0.2, 0.7, 0.35), title: "What works best, and why",
-          body: "Reader+ can read anything an app shares with accessibility: web pages in Safari and Chrome, Mail, Notes, TextEdit, Pages, and most menus and buttons.\n\nPictures of text, like scanned PDFs, images and some games, have no actual words in them, so there's nothing for Reader+ to read. If something stays silent, select it and press Control Option S.\n\nPress Control Option H at any time for spoken help, or Control Option T to take this tour again."),
+    Slide(symbol: "slider.horizontal.3", color: rgb(0.95, 0.75, 0.1), title: "Everything else",
+          body: "Mouse Echo reads what the pointer rests on. Key Echo says what you type. The reading window shows big, high-contrast text with each word highlighted.\n\nYou turn these on in the Reader+ window or from the Reader+ icon in the menu bar, not with keys. If you ever want lots of keyboard commands, that's what VoiceOver is for."),
+    Slide(symbol: "checkmark.seal.fill", color: rgb(0.2, 0.7, 0.35), title: "You're ready",
+          body: "Remember three things. Command-click to read. Command right-click to read the whole page. Tap Control to stop.\n\nYou can take this tour again from the Reader+ window, under General."),
 ]
 
 final class TourController: NSObject, NSWindowDelegate {
@@ -1425,7 +1484,7 @@ final class TourController: NSObject, NSWindowDelegate {
     func spokenText() -> String {
         let s = slides[index]
         var t = "\(s.title.replacingOccurrences(of: "⌘-click", with: "Command click")). "
-        if let k = s.spokenKeys { t += "Shortcut: \(k). " }
+        if let k = s.spokenKeys { t += "How: \(k). " }
         t += s.body.replacingOccurrences(of: "\n\n", with: " ")
         if s.permissions {
             t += " Right now, Accessibility is \(AXIsProcessTrusted() ? "on" : "off"), Input Monitoring is \(CGPreflightListenEventAccess() ? "on" : "off"), and Screen Recording is \(CGPreflightScreenCaptureAccess() ? "on" : "off")."
@@ -1585,12 +1644,12 @@ struct KeysText: View {
 }
 
 let shortcutList: [(String, String)] = [
-    ("Read selected text", "⌃⌥S"), ("Read from the cursor, or the whole page", "⌃⌥R"), ("Read the clipboard", "⌃⌥V"),
-    ("Stop talking", "Tap ⌃ Control"), ("Pause or resume", "⌃⌥P"), ("Faster / slower", "⌃⌥=  /  ⌃⌥−"),
-    ("Next / previous paragraph", "⌃⌥→  /  ⌃⌥←"), ("Next / previous heading", "⌃⌥↓  /  ⌃⌥↑"),
-    ("Read by headings and paragraphs, a whole social media post, or the words in a picture", "⌘-click"),
-    ("Read the words in the window under the pointer (OCR)", "⌃⌥O"), ("Mouse Echo", "⌃⌥M"), ("Key Echo", "⌃⌥K"),
-    ("Reading window", "⌃⌥W"), ("Spoken help", "⌃⌥H"), ("Tour", "⌃⌥T"),
+    ("Read a heading, paragraph, post or picture", "⌘-click"),
+    ("Read the whole page or window", "⌘-right-click"),
+    ("Pause or resume", "⌘-right-click while reading"),
+    ("Previous / next paragraph", "⌘ + mouse Back / Forward"),
+    ("Faster / slower", "⌘ + scroll up / down"),
+    ("Stop talking", "Tap ⌃ Control"),
 ]
 
 struct ControlView: View {
@@ -1646,10 +1705,13 @@ struct GeneralPane: View {
                 LabeledContent("Guided tour") { Button("Take the Tour…") { TourController.shared.show() } }
                 LabeledContent("Spoken help") { Button("Play") { appDel.help() } }
             }
-            Section("Keyboard Shortcuts") {
+            Section {
                 ForEach(shortcutList.indices, id: \.self) { i in
                     LabeledContent(shortcutList[i].0) { KeysText(keys: shortcutList[i].1) }
                 }
+            } header: { Text("Mouse Commands") } footer: {
+                Text("If you picked ⌥⌘-Click under Click to Read, hold Option as well. That's all there is to learn; for lots of keyboard commands, use VoiceOver.")
+                    .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
@@ -1666,10 +1728,10 @@ struct ReadingPane: View {
     var body: some View {
         Form {
             Section {
-                row("Selected text", "text.cursor", "⌃⌥S") { PreviousApp.shared.run { appDel.readSelection() } }
-                row("From the cursor, or the whole page", "doc.text", "⌃⌥R") { PreviousApp.shared.run { appDel.readFromFocus() } }
-                row("Clipboard", "doc.on.clipboard", "⌃⌥V") { appDel.readClipboard() }
-                row("Words in pictures under the pointer", "text.viewfinder", "⌃⌥O") { appDel.readScreenUnderPointer() }
+                row("Selected text", "text.cursor", "") { PreviousApp.shared.run { appDel.readSelection() } }
+                row("From the cursor, or the whole page", "doc.text", "") { PreviousApp.shared.run { appDel.readFromFocus() } }
+                row("Clipboard", "doc.on.clipboard", "") { appDel.readClipboard() }
+                row("Words in pictures under the pointer", "text.viewfinder", "") { appDel.readScreenUnderPointer() }
             } header: { Text("Read") } footer: {
                 Text("These buttons switch back to the app you were using, then read from it.").foregroundStyle(.secondary)
             }
@@ -1684,6 +1746,8 @@ struct ReadingPane: View {
                     Spacer()
                 }
                 LabeledContent("Stop at any time") { KeysText(keys: "Tap ⌃ Control") }
+                LabeledContent("Pause or resume") { KeysText(keys: "⌘-right-click") }
+                LabeledContent("Faster / slower") { KeysText(keys: "⌘ + scroll") }
             }
         }
         .formStyle(.grouped)
@@ -1705,7 +1769,7 @@ struct ClickPane: View {
                 .pickerStyle(.radioGroup)
                 Toggle("Open the reading window when I click", isOn: model.bool(Key.clickShowsReader))
             } footer: {
-                Text("Clicking a heading reads the heading and everything under it, up to the next heading of the same level. On Facebook, Instagram, X and other social sites, clicking a post opens See more and reads the whole post. Clicking a picture reads the words in it. Clicks read aloud without opening the reading window unless you turn it on above. Command-clicking a link still opens it normally.")
+                Text("Command right-click reads the whole page or window, and pauses or resumes while Reader+ is talking. While reading, hold Command and use your mouse's Back and Forward buttons to move by paragraph, or the scroll wheel to change the speed. Clicking a heading reads the heading and everything under it, up to the next heading of the same level. On Facebook, Instagram, X and other social sites, clicking a post opens See more and reads the whole post. Clicking a picture reads the words in it. Clicks read aloud without opening the reading window unless you turn it on above. Command-clicking a link still opens it normally.")
                     .foregroundStyle(.secondary)
             }
         }
@@ -1911,22 +1975,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var status: NSStatusItem!
 
     let helpText = """
-    Reader plus commands. All use Control and Option together. \
-    S: read the selected text. \
-    R: read from the cursor, or read the whole window or web page. \
-    V: read the clipboard. \
-    P: pause or resume. \
+    Reader plus works with the mouse while you hold the Command key. \
+    Command-click a heading to hear it and everything under it. Command-click a paragraph to hear the article from there. \
+    Command-click a social media post to hear the whole post, or a picture to hear the words in it. \
+    Command right-click to hear the whole page or window. While Reader plus is talking, Command right-click pauses and resumes. \
+    Hold Command and press the Back or Forward button on the side of your mouse to go to the previous or next paragraph. \
+    Hold Command and scroll up to read faster, or down to read slower. \
     Tap the Control key by itself to stop talking. \
-    M: turn Mouse Echo on or off; it reads whatever the pointer rests on. \
-    K: Key Echo; it switches between off, characters, words, and both. \
-    Equals: faster. Minus: slower. \
-    W: show or hide the reading window. \
-    Left and right arrows: previous or next paragraph. Up and down arrows: previous or next heading. \
-    O: read the words in the window under the pointer, even in pictures. \
-    H: this help. T: take the tour. \
-    You can also hold Command and click a heading to hear that heading and everything under it, \
-    or click a paragraph to hear the article from there. \
-    Command-click a picture to hear the words in it. On social media, Command-click a post to hear the whole post.
+    Everything else, like Mouse Echo, Key Echo and the reading window, is in the Reader plus window and the menu bar icon.
     """
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -1936,20 +1992,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = PreviousApp.shared
         buildMenu()
         buildMainMenu()
-        installHotKeys([
-            (kVK_ANSI_S, readSelection), (kVK_ANSI_R, readFromFocus), (kVK_ANSI_V, readClipboard),
-            (kVK_ANSI_P, { Speaker.shared.pauseOrResume(); ReaderWindow.shared.setPlaying(!Speaker.shared.isPaused && Speaker.shared.isReading) }),
-            (kVK_ANSI_X, { Speaker.shared.stop() }),
-            (kVK_ANSI_M, toggleMouseEcho), (kVK_ANSI_K, cycleKeyEcho),
-            (kVK_ANSI_Equal, { Reading.shared.changeRate(0.05) }), (kVK_ANSI_Minus, { Reading.shared.changeRate(-0.05) }),
-            (kVK_ANSI_W, { ReaderWindow.shared.toggle() }), (kVK_ANSI_H, { say(self.helpText) }),
-            (kVK_ANSI_T, { TourController.shared.show() }),
-            (kVK_ANSI_O, { self.readScreenUnderPointer() }),
-            (kVK_RightArrow, { Reading.shared.jump(1, headingsOnly: false) }),
-            (kVK_LeftArrow, { Reading.shared.jump(-1, headingsOnly: false) }),
-            (kVK_DownArrow, { Reading.shared.jump(1, headingsOnly: true) }),
-            (kVK_UpArrow, { Reading.shared.jump(-1, headingsOnly: true) }),
-        ])
         ClickReader.shared.start()
         MouseEcho.shared.apply()
         KeyEcho.shared.startTap()
@@ -1965,7 +2007,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             say("Reader plus is on. To let it read other apps, it needs Accessibility permission. In the window that just opened, choose Open System Settings, then turn on Reader plus.")
             waitForTrust()
         } else {
-            say("Reader plus ready. Press Control Option H for help.")
+            say("Reader plus ready. Hold Command and click to read.")
         }
     }
 
@@ -2105,14 +2147,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let on = on { i.state = on ? .on : .off }
             m.addItem(i); return i
         }
-        _ = item("Read Selected Text", #selector(readSelection), "s")
-        _ = item("Read From Here (AppReader)", #selector(readFromFocus), "r")
-        _ = item("Read Clipboard", #selector(readClipboard), "v")
-        _ = item("Read Text in Window Under Pointer (OCR)", #selector(readScreenUnderPointer), "o")
-        _ = item(Speaker.shared.isPaused ? "Resume" : "Pause", #selector(pauseResume), "p")
-        _ = item("Stop Talking (tap Control)", #selector(stopSpeech), "x")
+        _ = item("Read Selected Text", #selector(readSelection))
+        _ = item("Read From the Cursor, or the Whole Page", #selector(readFromFocus))
+        _ = item("Read Clipboard", #selector(readClipboard))
+        _ = item("Read Text in Window Under Pointer (OCR)", #selector(readScreenUnderPointer))
+        _ = item(Speaker.shared.isPaused ? "Resume" : "Pause", #selector(pauseResume))
+        _ = item("Stop Talking (tap Control)", #selector(stopSpeech))
         m.addItem(.separator())
-        _ = item("Mouse Echo", #selector(toggleMouseEcho), "m", on: prefs.bool(forKey: Key.mouseEcho))
+        _ = item("Mouse Echo", #selector(toggleMouseEcho), on: prefs.bool(forKey: Key.mouseEcho))
         let keyItem = item("Key Echo", nil)
         let km = NSMenu()
         for (i, t) in ["Off", "Characters", "Words", "Characters and Words"].enumerated() {
@@ -2171,13 +2213,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         voiceItem.submenu = vm
         let speed = Int((prefs.double(forKey: Key.rate) * 100).rounded())
         item("Speed: \(speed)%", nil).isEnabled = false
-        _ = item("Faster", #selector(faster), "=")
-        _ = item("Slower", #selector(slower), "-")
+        _ = item("Faster", #selector(faster))
+        _ = item("Slower", #selector(slower))
         m.addItem(.separator())
-        _ = item(ReaderWindow.shared.isVisible ? "Hide Reading Window" : "Show Reading Window", #selector(toggleReader), "w")
+        _ = item(ReaderWindow.shared.isVisible ? "Hide Reading Window" : "Show Reading Window", #selector(toggleReader))
         _ = item("Open at Login", #selector(toggleLogin), on: SMAppService.mainApp.status == .enabled)
-        _ = item("Spoken Help", #selector(help), "h")
-        _ = item("Take the Tour…", #selector(tour), "t")
+        _ = item("Spoken Help", #selector(help))
+        _ = item("Take the Tour…", #selector(tour))
         _ = item("Show Reader+ Controls", #selector(showControls))
         m.addItem(.separator())
         let q = NSMenuItem(title: "Quit Reader+", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
