@@ -23,6 +23,7 @@ Reader+ is made for the mouse. There's no list of keyboard shortcuts to learn: y
 - **Stop, move and change speed with the mouse.** While Reader+ is talking, ⌘-right-click stops it, ⌘ with your mouse's Back and Forward side buttons moves by paragraph, and ⌘ with the scroll wheel makes speech faster (up) or slower (down).
 - **Stop with Control, just like VoiceOver.** Tap the Control key by itself to stop talking.
 - **Siri voice.** Choose *Siri / System Voice* in Reader+ and it speaks with the voice picked in System Settings › Accessibility › Spoken Content, including Siri voices.
+- **ElevenLabs voices (optional).** Paste your own ElevenLabs API key in Reader+'s Voice settings and choose one of your ElevenLabs voices for very human-sounding reading. The key is kept in your Mac's Keychain. When an ElevenLabs voice is chosen, the text being read is sent to ElevenLabs and uses your credits; if it can't be reached, Reader+ carries on with an Apple voice.
 - **Mouse Echo.** Rest the pointer on a button, menu, link or line of text to hear it, for example "Save, button".
 - **Key Echo.** Hear the characters, the words, or both as you type.
 - **Reading window.** Big, high-contrast text, with the word being spoken highlighted. There are five color schemes and adjustable size.
@@ -70,7 +71,7 @@ Turn them on in **System Settings → Privacy & Security**. Reader+'s **Permissi
 
 ## Privacy
 
-Reader+ has no account, no ads, no analytics and no network access. Speech and text recognition happen entirely on your Mac. The only file it writes is a small log at `~/Library/Logs/Reader+.log`, which helps with troubleshooting.
+Reader+ has no account, no ads and no analytics. Speech and text recognition happen entirely on your Mac, and Reader+ uses the internet only if you choose an ElevenLabs voice: then the text being read is sent to ElevenLabs to make the speech. The only file it writes is a small log at `~/Library/Logs/Reader+.log`, which helps with troubleshooting.
 
 ## Build from source
 
