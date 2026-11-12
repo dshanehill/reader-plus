@@ -895,7 +895,7 @@ final class KeyEcho {
         let isControl = code == 59 || code == 62
         let others: CGEventFlags = [.maskCommand, .maskAlternate, .maskShift]
         if isControl && flags.contains(.maskControl) && flags.intersection(others).isEmpty { controlAlone = true }
-        else if isControl && !flags.contains(.maskControl) && controlAlone { controlAlone = false; Speaker.shared.stop() }
+        else if isControl && !flags.contains(.maskControl) && controlAlone { controlAlone = false; Speaker.shared.stop(); Overlay.shared.hide() }
         else { controlAlone = false }
     }
 
@@ -1047,6 +1047,7 @@ final class ClickReader {
     func start() {
         guard tap == nil, AXIsProcessTrusted() else { return }
         let mask = (1 << CGEventType.leftMouseDown.rawValue) | (1 << CGEventType.leftMouseUp.rawValue)
+            | (1 << CGEventType.flagsChanged.rawValue) | (1 << CGEventType.keyDown.rawValue)
         guard let t = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
                                         eventsOfInterest: CGEventMask(mask), callback: clickTapCallback, userInfo: nil) else {
             log("click tap not available"); return
@@ -1091,6 +1092,15 @@ final class ClickReader {
 let clickTapCallback: CGEventTapCallBack = { _, type, event, _ in
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
         if let t = ClickReader.shared.tap { CGEvent.tapEnable(tap: t, enable: true) }
+        return Unmanaged.passUnretained(event)
+    }
+    if type == .flagsChanged || type == .keyDown {
+        // Tap Control by itself to stop talking, like VoiceOver. Only used when Key Echo's listener isn't running.
+        if KeyEcho.shared.tap == nil {
+            let code = event.getIntegerValueField(.keyboardEventKeycode), flags = event.flags
+            if type == .flagsChanged { DispatchQueue.main.async { KeyEcho.shared.flagsChanged(code, flags) } }
+            else { DispatchQueue.main.async { KeyEcho.shared.controlAlone = false } }
+        }
         return Unmanaged.passUnretained(event)
     }
     if type == .leftMouseDown, ClickReader.modifiersMatch(event.flags) {
@@ -1167,7 +1177,7 @@ let slides: [Slide] = [
     Slide(symbol: "text.bubble.fill", color: rgb(0.96, 0.45, 0.15), title: "Welcome to Reader+",
           body: "Reader+ reads your screen out loud using the Mac's own voices, the same ones VoiceOver uses, without turning VoiceOver on. Your magnifier stays exactly as it is. Reader+ just adds speech.\n\nPress Return or click Next to go on. Press the Left arrow or click Back to go back."),
     Slide(symbol: "lock.open.fill", color: rgb(0.2, 0.7, 0.35), title: "Two permissions, and why",
-          body: "macOS keeps apps from reading other apps' text unless you allow it.\n\nAccessibility lets Reader+ see the words in Safari, Chrome, Mail and your other apps. Input Monitoring lets Key Echo hear your typing and a tap of Control stop speech. Screen Recording lets Reader+ read the words in pictures.",
+          body: "macOS keeps apps from reading other apps' text unless you allow it.\n\nAccessibility lets Reader+ see the words in Safari, Chrome, Mail and your other apps. Input Monitoring lets Key Echo hear your typing. Screen Recording lets Reader+ read the words in pictures.",
           permissions: true),
     Slide(symbol: "text.cursor", color: rgb(0.2, 0.5, 1), title: "Read what you select",
           body: "Select text in any app, then press Control Option S. Reader+ reads it in the reading window and outlines each word on screen as it goes.\n\nIt asks the app for your selection directly. If an app won't share it, Reader+ copies it quietly and then puts your clipboard back the way it was.",
@@ -1195,9 +1205,9 @@ let slides: [Slide] = [
     Slide(symbol: "keyboard", color: rgb(0.35, 0.4, 0.95), title: "Key Echo",
           body: "Key Echo says what you type. Press Control Option K to switch between Off, Characters, Words, and both.\n\nWords are spoken when you press space or a punctuation mark, so you hear whole words without hearing every letter.",
           keys: ["⌃ Control", "⌥ Option", "K"], spokenKeys: "Control Option K"),
-    Slide(symbol: "speaker.wave.3.fill", color: rgb(0.96, 0.45, 0.15), title: "Pause, stop, speed and voice",
-          body: "Control Option P pauses and resumes. Tap Control by itself to stop, just like in VoiceOver. Control Option Equals and Minus make it faster or slower, even in the middle of a sentence.\n\nYou can pick a voice from the Reader+ menu. Enhanced and Premium voices sound the most natural, and you can download more with Get More Voices.",
-          keys: ["⌃ Control", "⌥ Option", "P"], spokenKeys: "Control Option P"),
+    Slide(symbol: "speaker.wave.3.fill", color: rgb(0.96, 0.45, 0.15), title: "Stop, speed and voice",
+          body: "To stop talking, just tap the Control key by itself, exactly like VoiceOver. Control Option Equals and Minus make it faster or slower, even in the middle of a sentence.\n\nYou can pick a voice from the Reader+ menu. Enhanced and Premium voices sound the most natural, and you can download more with Get More Voices.",
+          keys: ["⌃ Control"], spokenKeys: "Control"),
     Slide(symbol: "checkmark.seal.fill", color: rgb(0.2, 0.7, 0.35), title: "What works best, and why",
           body: "Reader+ can read anything an app shares with accessibility: web pages in Safari and Chrome, Mail, Notes, TextEdit, Pages, and most menus and buttons.\n\nPictures of text, like scanned PDFs, images and some games, have no actual words in them, so there's nothing for Reader+ to read. If something stays silent, select it and press Control Option S.\n\nPress Control Option H at any time for spoken help, or Control Option T to take this tour again."),
 ]
@@ -1576,7 +1586,7 @@ struct KeysText: View {
 
 let shortcutList: [(String, String)] = [
     ("Read selected text", "⌃⌥S"), ("Read from the cursor, or the whole page", "⌃⌥R"), ("Read the clipboard", "⌃⌥V"),
-    ("Pause or resume", "⌃⌥P"), ("Stop talking", "Tap ⌃"), ("Faster / slower", "⌃⌥=  /  ⌃⌥−"),
+    ("Stop talking", "Tap ⌃ Control"), ("Pause or resume", "⌃⌥P"), ("Faster / slower", "⌃⌥=  /  ⌃⌥−"),
     ("Next / previous paragraph", "⌃⌥→  /  ⌃⌥←"), ("Next / previous heading", "⌃⌥↓  /  ⌃⌥↑"),
     ("Read by headings and paragraphs, a whole social media post, or the words in a picture", "⌘-click"),
     ("Read the words in the window under the pointer (OCR)", "⌃⌥O"), ("Mouse Echo", "⌃⌥M"), ("Key Echo", "⌃⌥K"),
@@ -1846,7 +1856,7 @@ struct PermissionsPane: View {
                 permission("Accessibility", "Lets Reader+ see the text in your other apps.", on: AXIsProcessTrusted()) {
                     TourController.shared.openAccessibility()
                 }
-                permission("Input Monitoring", "Lets Key Echo hear your typing, and a tap of Control stop speech.", on: CGPreflightListenEventAccess()) {
+                permission("Input Monitoring", "Lets Key Echo hear what you type.", on: CGPreflightListenEventAccess()) {
                     TourController.shared.openInputMonitoring()
                 }
                 permission("Screen Recording", "Lets Reader+ read the words in pictures and scanned pages.", on: CGPreflightScreenCaptureAccess()) {
