@@ -953,6 +953,21 @@ func headingLevel(_ e: AXUIElement) -> Int {
 let skipRoles: Set<String> = ["AXButton", "AXMenuButton", "AXPopUpButton", "AXCheckBox", "AXRadioButton",
                               "AXTextField", "AXComboBox", "AXToolbar", "AXMenu", "AXMenuBar", "AXSlider"]
 
+/// The height of one line of text inside an element (from its smallest piece of text).
+func lineHeight(in e: AXUIElement) -> CGFloat {
+    var best: CGFloat = 0, seen = 0
+    func walk(_ x: AXUIElement, _ d: Int) {
+        if d > 4 || seen > 60 { return }
+        seen += 1
+        if axString(x, "AXRole") == "AXStaticText", let f = axFrame(x), f.height >= 8 {
+            if best == 0 || f.height < best { best = f.height }
+        }
+        for c in axChildren(x) { walk(c, d + 1) }
+    }
+    walk(e, 0)
+    return best > 0 ? min(max(best, 12), 64) : 22
+}
+
 /// Do two containers sit side by side in the same paragraph (same parent, or one inside the other)?
 func sameParagraph(_ a: AXUIElement, _ b: AXUIElement) -> Bool {
     guard let pb = axElement(b, "AXParent") else { return false }
@@ -1585,14 +1600,46 @@ final class Reading {
         if let e = src.element,
            let rect = axRectValue(axParam(e, "AXBoundsForRange", makeRange(src.base + full.location, full.length))) {
             Overlay.shared.show(axRect: rect)
-        } else if let bi = blockIndex(at: full.location), bi != currentBlock {
-            currentBlock = bi
-            let el = src.blocks[bi].element
-            DispatchQueue.global(qos: .userInitiated).async {
-                AXUIElementPerformAction(el, "AXScrollToVisible" as CFString)
-                usleep(120_000)
-                let f = axFrame(el)
-                DispatchQueue.main.async { if let f = f, self.currentBlock == bi { Overlay.shared.show(axRect: f) } }
+        } else if let bi = blockIndex(at: full.location) {
+            if bi != currentBlock {
+                // A new paragraph: bring it on screen and learn its size and line height.
+                currentBlock = bi; blockFrame = nil; lastLine = -1
+                let el = src.blocks[bi].element
+                DispatchQueue.global(qos: .userInitiated).async {
+                    AXUIElementPerformAction(el, "AXScrollToVisible" as CFString)
+                    usleep(120_000)
+                    let f = axFrame(el)
+                    let lh = lineHeight(in: el)
+                    DispatchQueue.main.async {
+                        guard self.currentBlock == bi, let f = f else { return }
+                        self.blockFrame = f; self.blockLineHeight = lh
+                        self.followLine(self.lastWord)
+                    }
+                }
+            } else { followLine(full) }
+        }
+    }
+
+    // The yellow outline follows the line being read inside the current paragraph.
+    var blockFrame: CGRect?
+    var blockLineHeight: CGFloat = 22
+    var lastLine = -1
+
+    func followLine(_ full: NSRange) {
+        guard let src = source, currentBlock >= 0, currentBlock < src.blocks.count, let f = blockFrame else { return }
+        let b = src.blocks[currentBlock].range
+        let frac = Double(max(0, full.location - b.location)) / Double(max(1, b.length))
+        let lines = max(1, Int((f.height / blockLineHeight).rounded()))
+        let line = min(lines - 1, max(0, Int(frac * Double(lines))))
+        guard line != lastLine else { return }
+        lastLine = line
+        let h = f.height / CGFloat(lines)
+        Overlay.shared.show(axRect: CGRect(x: f.minX, y: f.minY + CGFloat(line) * h, width: f.width, height: h))
+        // If the page was scrolled, keep the outline in the right place.
+        let el = src.blocks[currentBlock].element, bi = currentBlock
+        DispatchQueue.global(qos: .utility).async {
+            if let nf = axFrame(el), nf.origin != f.origin {
+                DispatchQueue.main.async { if self.currentBlock == bi { self.blockFrame = nf; self.lastLine = -1; self.followLine(self.lastWord) } }
             }
         }
     }
