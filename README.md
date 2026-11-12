@@ -15,6 +15,8 @@ Reader+ is shared freely to help the partially sighted and low-vision community.
 Reader+ is made for the mouse. There's no list of keyboard shortcuts to learn: you hold **Command** and use your mouse. If you want lots of keyboard commands, that's what VoiceOver is for.
 
 - **⌘-click to read by headings and paragraphs.** Click a heading to hear it and everything under it, up to the next heading. Click a paragraph to hear everything from there to the end without stopping, or just that paragraph if you prefer. It works in AI chat apps too (Claude, ChatGPT and others), so you can hear a whole reply even when the app has no read-aloud button.
+- **Links and long lists too.** ⌘-click a link to hear it and everything after it, instead of opening it. It starts exactly where you click, even far down a long page like a YouTube list, and carries on down from there.
+- **Other apps.** ⌘-click reads text, buttons and boxes in any app. In Finder, Mail and other lists, ⌘-click still selects things as usual and Reader+ reads the item.
 - **Whole posts on social media.** On Facebook, Instagram, X, Threads, LinkedIn, Reddit and similar sites, ⌘-click a post. Reader+ presses *See more* for you and reads the entire post. It skips the Like, Comment and Share buttons.
 - **Words in pictures (OCR).** ⌘-click a screenshot, meme or scanned page to hear the words in it. It uses the Mac's built-in text recognition, so nothing leaves your computer.
 - **Read a whole page.** ⌘-right-click anywhere on a page or window to hear all of it from the top. If it has no real text, Reader+ reads the words it sees on screen.
