@@ -22,6 +22,7 @@ Reader+ is made for the mouse. There's no list of keyboard shortcuts to learn: y
 - **Read a whole page.** ⌘-right-click anywhere on a page or window to hear all of it from the top. If it has no real text, Reader+ reads the words it sees on screen.
 - **Stop, move and change speed with the mouse.** While Reader+ is talking, ⌘-right-click stops it, ⌘ with your mouse's Back and Forward side buttons moves by paragraph, and ⌘ with the scroll wheel makes speech faster (up) or slower (down).
 - **Stop with Control, just like VoiceOver.** Tap the Control key by itself to stop talking.
+- **Siri voice.** Choose *Siri / System Voice* in Reader+ and it speaks with the voice picked in System Settings › Accessibility › Spoken Content, including Siri voices.
 - **Mouse Echo.** Rest the pointer on a button, menu, link or line of text to hear it, for example "Save, button".
 - **Key Echo.** Hear the characters, the words, or both as you type.
 - **Reading window.** Big, high-contrast text, with the word being spoken highlighted. There are five color schemes and adjustable size.
