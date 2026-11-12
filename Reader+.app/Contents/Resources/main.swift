@@ -251,24 +251,52 @@ func headingLevel(_ e: AXUIElement) -> Int {
 let skipRoles: Set<String> = ["AXButton", "AXMenuButton", "AXPopUpButton", "AXCheckBox", "AXRadioButton",
                               "AXTextField", "AXComboBox", "AXToolbar", "AXMenu", "AXMenuBar", "AXSlider"]
 
+/// Do two containers sit side by side in the same paragraph (same parent, or one inside the other)?
+func sameParagraph(_ a: AXUIElement, _ b: AXUIElement) -> Bool {
+    guard let pb = axElement(b, "AXParent") else { return false }
+    if CFEqual(pb, a) { return true }
+    if let pa = axElement(a, "AXParent"), CFEqual(pa, pb) { return true }
+    return false
+}
+
+/// The paragraph-level element that holds a clicked spot: the first ancestor that isn't text, a link or a picture.
+func blockStart(_ chain: [AXUIElement], within root: AXUIElement) -> AXUIElement? {
+    let inline: Set<String> = ["AXStaticText", "AXLink", "AXImage", "AXButton", "AXCheckBox", "AXRadioButton",
+                               "AXTextField", "AXPopUpButton", "AXMenuButton"]
+    for a in chain {
+        if CFEqual(a, root) { return nil }
+        if !inline.contains(axString(a, "AXRole") ?? "") { return a }
+    }
+    return nil
+}
+
 /// Splits a web page (or other content) into headings and paragraphs, in reading order.
-func collectBlocks(_ root: AXUIElement) -> [DocBlock] {
+/// With `startNode`, it starts there (the spot you clicked) and only goes forward, so even the
+/// bottom of a very long page (a YouTube list, a long feed) is reached quickly.
+func collectBlocks(_ root: AXUIElement, from startNode: AXUIElement? = nil) -> [DocBlock] {
     var blocks: [DocBlock] = []
     var visited = 0
+    var path: [AXUIElement] = []
+    if let st = startNode {
+        let up = ancestors(st, max: 150)
+        if let ri = up.firstIndex(where: { CFEqual($0, root) }) { path = Array(up[0...ri].reversed()) }
+    }
     func add(_ text: String, _ container: AXUIElement, _ heading: Int) {
         if var last = blocks.last {
             if CFEqual(last.element, container) && last.heading == heading {
                 last.text += " " + text; blocks[blocks.count - 1] = last; return
             }
-            // Inline pieces of one sentence sometimes come in separate containers — keep them together.
-            if heading == 0 && last.heading == 0, let ch = last.text.last, !".!?:;\"”)]".contains(ch) {
+            // Pieces of one sentence split across little containers — keep them together, but only when
+            // they really are in the same paragraph (never glue separate list items or videos together).
+            if heading == 0 && last.heading == 0, let ch = last.text.last, !".!?:;\"”)]".contains(ch),
+               (last.text as NSString).length < 400, sameParagraph(last.element, container) {
                 last.text += " " + text; blocks[blocks.count - 1] = last; return
             }
         }
         blocks.append(DocBlock(element: container, text: text, heading: heading))
     }
-    func walk(_ e: AXUIElement, _ depth: Int, _ container: AXUIElement, _ heading: Int) {
-        if visited > 40000 || depth > 120 { return }
+    func walk(_ e: AXUIElement, _ depth: Int, _ container: AXUIElement, _ heading: Int, _ pi: Int?) {
+        if visited > 40000 || depth > 150 { return }
         visited += 1
         let role = axString(e, "AXRole") ?? ""
         if skipRoles.contains(role) { return }
@@ -282,9 +310,20 @@ func collectBlocks(_ root: AXUIElement) -> [DocBlock] {
         }
         let next: AXUIElement = role == "AXLink" ? container : e
         let h = role == "AXHeading" ? headingLevel(e) : heading
-        for c in axChildren(e) { walk(c, depth + 1, next, h) }
+        let kids = axChildren(e)
+        if let i = pi, i + 1 < path.count {
+            // Skip everything before the clicked spot.
+            let target = path[i + 1]
+            guard let at = kids.firstIndex(where: { CFEqual($0, target) }) else {
+                for c in kids { walk(c, depth + 1, next, h, nil) }; return
+            }
+            walk(kids[at], depth + 1, next, h, i + 1)
+            for c in kids[(at + 1)...] { walk(c, depth + 1, next, h, nil) }
+        } else {
+            for c in kids { walk(c, depth + 1, next, h, nil) }
+        }
     }
-    walk(root, 0, root, 0)
+    walk(root, 0, root, 0, path.isEmpty ? nil : 0)
     return blocks
 }
 
@@ -346,20 +385,28 @@ func readSourceAt(_ p: CGPoint) -> ReadSource? {
         return ReadSource(text: ns.substring(with: r), element: ta, base: r.location)
     }
 
+    // Buttons, boxes, checkboxes, menus and the like: say what they are, like "Subscribe, button".
+    let hitRole = axString(hit, "AXRole") ?? ""
+    if controlRoles.contains(hitRole) && hitRole != "AXLink" {
+        if let t = textAt(p), !t.text.trimmed.isEmpty { return ReadSource(text: t.text, element: nil, base: 0) }
+    }
+    // Lists where ⌘-click selects (Finder, Mail, the Dock…): read just that item.
+    if chain.prefix(8).contains(where: { selectionRoles.contains(axString($0, "AXRole") ?? "") })
+        && !chain.contains(where: { axString($0, "AXRole") == "AXWebArea" }) {
+        if let t = textAt(p), !t.text.trimmed.isEmpty { return ReadSource(text: t.text, element: nil, base: 0) }
+        let t = collectText(hit); if !t.trimmed.isEmpty { return ReadSource(text: t, element: nil, base: 0) }
+    }
+
     // Web pages: headings and paragraphs.
     guard let web = chain.first(where: { axString($0, "AXRole") == "AXWebArea" }) else {
         // Native apps (for example a chat app's replies): read from the clicked paragraph onward.
         if let area = chain.first(where: { axString($0, "AXRole") == "AXScrollArea" }) {
-            let blocks = collectBlocks(area)
-            if !blocks.isEmpty {
-                var index: Int? = nil
-                for a in chain { if let i = blocks.firstIndex(where: { CFEqual($0.element, a) }) { index = i; break } }
-                if index == nil { index = blocks.firstIndex(where: { axFrame($0.element)?.contains(p) ?? false }) }
-                if let i = index { return sourceFromBlocks(blocks, start: i, sectionOnly: true, paragraphOnly: paragraphOnly) }
-            }
+            let blocks = collectBlocks(area, from: blockStart(chain, within: area))
+            if !blocks.isEmpty { return sourceFromBlocks(blocks, start: 0, sectionOnly: true, paragraphOnly: paragraphOnly) }
         }
         if let t = textAt(p) { return ReadSource(text: t.text, element: nil, base: 0) }
-        return nil
+        let t = collectText(hit)
+        return t.trimmed.isEmpty ? nil : ReadSource(text: t, element: nil, base: 0)
     }
 
     // Social media: read the whole post, opening "See more" first.
@@ -377,17 +424,11 @@ func readSourceAt(_ p: CGPoint) -> ReadSource? {
         if !b.isEmpty { return sourceFromBlocks(b, start: 0, sectionOnly: false, paragraphOnly: false) }
     }
 
-    // Other pages: if the click is inside an <article>, work within it (much faster on big pages).
+    // Every other page: start exactly where you clicked (a paragraph, a link, a video in a long list)
+    // and keep going down the page from there.
     let root = chain.first(where: { isArticle($0) }) ?? web
-    let blocks = collectBlocks(root)
-    var index: Int? = nil
-    if !blocks.isEmpty {
-        for a in chain {
-            if let i = blocks.firstIndex(where: { CFEqual($0.element, a) }) { index = i; break }
-        }
-        if index == nil { index = blocks.firstIndex(where: { axFrame($0.element)?.contains(p) ?? false }) }
-    }
-    if let i = index { return sourceFromBlocks(blocks, start: i, sectionOnly: true, paragraphOnly: paragraphOnly) }
+    let blocks = collectBlocks(root, from: blockStart(chain, within: root))
+    if !blocks.isEmpty { return sourceFromBlocks(blocks, start: 0, sectionOnly: true, paragraphOnly: paragraphOnly) }
 
     // Last resort: the nearest bit of the page around the click that has words in it.
     for a in chain.prefix(12) {
@@ -401,7 +442,7 @@ func readSourceAt(_ p: CGPoint) -> ReadSource? {
 // MARK: - Social media posts
 
 let socialHosts = ["facebook.com", "instagram.com", "x.com", "twitter.com", "threads.net", "threads.com",
-                   "linkedin.com", "reddit.com", "tiktok.com", "bsky.app", "tumblr.com", "mastodon", "youtube.com"]
+                   "linkedin.com", "reddit.com", "tiktok.com", "bsky.app", "tumblr.com", "mastodon"]
 
 func webURL(_ web: AXUIElement) -> String? {
     guard let u = ax(web, "AXURL") else { return nil }
@@ -430,7 +471,7 @@ func postContainer(_ chain: [AXUIElement], web: AXUIElement) -> AXUIElement? {
     for a in chain.prefix(30) {
         if CFEqual(a, web) { break }
         let t = collectText(a)
-        if t.count > 12000 { break }         // that's the whole feed, not one post
+        if t.count > 3000 { break }          // that's several posts or the whole feed, not one post
         if t.count >= 60 { best = a }
         if t.count >= 400 { break }
     }
@@ -470,7 +511,33 @@ func expandSeeMore(_ post: AXUIElement) -> Bool {
     return pressed
 }
 
-/// Should a ⌘-click at this point be used for reading? (Not on links or outside documents/web pages.)
+enum ClickUse { case ignore, read, readAndPass }
+
+/// What a ⌘-click at this point should do. Everything on a web page is read, links included.
+/// In other apps, text and controls are read too; in lists where ⌘-click selects things
+/// (Finder, Mail, the Dock), Reader+ reads the item and still lets the click select it.
+func clickUse(_ p: CGPoint) -> ClickUse {
+    var found: AXUIElement?
+    guard AXUIElementCopyElementAtPosition(systemWide, Float(p.x), Float(p.y), &found) == .success, let hit = found else { return .read }
+    AXUIElementSetMessagingTimeout(hit, 0.25)
+    var pid: pid_t = 0
+    if AXUIElementGetPid(hit, &pid) == .success {
+        exposeText(pid)
+        if NSRunningApplication(processIdentifier: pid)?.bundleIdentifier == "com.apple.dock" { return .readAndPass }
+    }
+    var cur: AXUIElement? = hit; var n = 0; var selectable = false
+    while let c = cur, n < 60 {
+        let r = axString(c, "AXRole") ?? ""
+        if r == "AXWebArea" { return .read }
+        if r == "AXMenuBar" || r == "AXMenu" { return .readAndPass }
+        if selectionRoles.contains(r) { selectable = true }
+        if r == "AXWindow" || r == "AXApplication" { break }
+        cur = axElement(c, "AXParent"); n += 1
+    }
+    return selectable ? .readAndPass : .read
+}
+
+/// Older check, kept for anything that only needs a yes or no.
 func clickIsReadable(_ p: CGPoint) -> Bool {
     var found: AXUIElement?
     guard AXUIElementCopyElementAtPosition(systemWide, Float(p.x), Float(p.y), &found) == .success, let hit = found else { return false }
@@ -1138,14 +1205,21 @@ final class ClickReader {
             var hit: AXUIElement?
             if AXUIElementCopyElementAtPosition(systemWide, Float(p.x), Float(p.y), &hit) == .success, let h = hit {
                 AXUIElementSetMessagingTimeout(h, 1.0)
-                let img = ancestors(h, max: 4).first(where: { axString($0, "AXRole") == "AXImage" })
-                if let im = img, let f = axFrame(im), f.width >= 24, f.height >= 24 {
+                let up = ancestors(h, max: 6)
+                let img = up.prefix(4).first(where: { axString($0, "AXRole") == "AXImage" })
+                let link = up.first(where: { axString($0, "AXRole") == "AXLink" })
+                let linkWords = link.map { collectText($0).trimmed } ?? ""
+                if let im = img, linkWords.count < 3, let f = axFrame(im), f.width >= 24, f.height >= 24 {
                     let desc = axString(im, "AXDescription") ?? axString(im, "AXTitle")
                     DispatchQueue.main.async { ocrRead(f, fallback: desc.map { "Image: \($0)" }, showWindow: showWindow) }
                     return
                 }
             }
+            let t0 = Date()
             let src = readSourceAt(p)
+            let app = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
+            log(String(format: "click in %@: %d blocks, %d chars, %.1fs, starts \"%@\"", app, src?.blocks.count ?? 0,
+                       (src?.text ?? "").count, Date().timeIntervalSince(t0), String((src?.text ?? "nothing").prefix(40))))
             DispatchQueue.main.async {
                 if let s = src, !s.text.trimmed.isEmpty { Reading.shared.start(s, showWindow: showWindow); return }
                 // Nothing in the page's text there — look at the screen instead.
@@ -1188,10 +1262,16 @@ let clickTapCallback: CGEventTapCallBack = { _, type, event, _ in
             }
             return nil
         }
-        if clickIsReadable(p) {
+        switch clickUse(p) {
+        case .read:
             ClickReader.shared.swallowUp = true
             ClickReader.shared.read(at: p)
             return nil // the click is used for reading, so the page doesn't get it
+        case .readAndPass:
+            ClickReader.shared.read(at: p)
+            return Unmanaged.passUnretained(event)
+        case .ignore:
+            break
         }
     }
     if type == .leftMouseUp && ClickReader.shared.swallowUp {
@@ -1288,7 +1368,7 @@ let slides: [Slide] = [
           body: "macOS keeps apps from reading other apps' text unless you allow it.\n\nAccessibility lets Reader+ see the words in Safari, Chrome, Mail and your other apps, and notice your Command-clicks. Screen Recording lets Reader+ read the words in pictures. Input Monitoring is only needed for Key Echo.",
           permissions: true),
     Slide(symbol: "list.bullet.indent", color: rgb(0.6, 0.35, 0.95), title: "⌘-click to read",
-          body: "Hold Command and click a heading to hear that heading and everything under it, up to the next heading. Command-click a paragraph to hear everything from there to the end, without stopping. This works in AI chat apps too, so you can hear a whole reply.\n\nThis works because web pages label their headings and paragraphs for accessibility, so Reader+ can follow an article the way it was written. Command-clicking a link still opens it as usual.",
+          body: "Hold Command and click a heading to hear that heading and everything under it, up to the next heading. Command-click a paragraph to hear everything from there to the end, without stopping. This works in AI chat apps too, so you can hear a whole reply.\n\nLinks work too: Command-click one to hear it and everything after it, like the rest of a list of videos. It starts exactly where you click, even far down a long page. In other apps, Command-click reads text, buttons and list items.",
           keys: ["⌘ Command", "Click"], spokenKeys: "Command click",
           practice: "Try it. Hold Command and click this paragraph. Reader+ reads from here to the end of this box.\n\nThis is the second paragraph. Reading carries on into it by itself.\n\nAnd here's a third paragraph, so you can hear it keep going."),
     Slide(symbol: "bubble.left.and.text.bubble.right.fill", color: rgb(0.25, 0.45, 0.95), title: "Whole posts on social media",
@@ -1815,7 +1895,7 @@ struct ClickPane: View {
                 .pickerStyle(.radioGroup)
                 Toggle("Open the reading window when I click", isOn: model.bool(Key.clickShowsReader))
             } footer: {
-                Text("Command right-click reads the whole page or window, and stops Reader+ while it's talking. While reading, hold Command and use your mouse's Back and Forward buttons to move by paragraph, or the scroll wheel to change the speed. Clicking a heading reads the heading and everything under it, up to the next heading of the same level. On Facebook, Instagram, X and other social sites, clicking a post opens See more and reads the whole post. Clicking a picture reads the words in it. Clicks read aloud without opening the reading window unless you turn it on above. Command-clicking a link still opens it normally.")
+                Text("Command right-click reads the whole page or window, and stops Reader+ while it's talking. While reading, hold Command and use your mouse's Back and Forward buttons to move by paragraph, or the scroll wheel to change the speed. Clicking a heading reads the heading and everything under it, up to the next heading of the same level. On Facebook, Instagram, X and other social sites, clicking a post opens See more and reads the whole post. Clicking a picture reads the words in it. Command-clicking a link reads it and carries on down the page, instead of opening it. Buttons and boxes say what they are. In Finder, Mail and other lists, Command-click still selects as usual and Reader+ reads the item. Clicks read aloud without opening the reading window unless you turn it on above.")
                     .foregroundStyle(.secondary)
             }
         }
