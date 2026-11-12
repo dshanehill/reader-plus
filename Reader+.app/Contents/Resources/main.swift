@@ -1592,12 +1592,12 @@ struct ControlView: View {
             List(Pane.allCases, selection: $pane) { p in
                 Label { Text(p.title) } icon: { PaneIcon(pane: p) }
             }
-            .navigationSplitViewColumnWidth(min: 200, ideal: 215, max: 260)
+            .navigationSplitViewColumnWidth(min: 150, ideal: 165, max: 200)
         } detail: {
             detail(pane ?? .general)
                 .navigationTitle((pane ?? .general).title)
         }
-        .frame(minWidth: 760, minHeight: 520)
+        .frame(minWidth: 540, idealWidth: 620, maxWidth: 900, minHeight: 380, idealHeight: 440, maxHeight: 700)
         .onAppear { model.startTicking() }
     }
 
@@ -1874,11 +1874,19 @@ final class ControlWindow: NSObject, NSWindowDelegate {
             w.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
             w.toolbar = NSToolbar(identifier: "ReaderPlusToolbar")
             w.toolbarStyle = .unified
-            w.setContentSize(NSSize(width: 820, height: 600))
+            // A small window, never full screen.
+            w.collectionBehavior = [.fullScreenNone]
+            w.contentMinSize = NSSize(width: 540, height: 380)
+            w.contentMaxSize = NSSize(width: 900, height: 700)
+            w.setContentSize(NSSize(width: 620, height: 440))
             w.isReleasedWhenClosed = false
             w.delegate = self
             w.center()
-            w.setFrameAutosaveName("ReaderPlusSettingsWindow")
+            w.setFrameAutosaveName("ReaderPlusSmallWindow")
+            // If a saved size is bigger than the small window, go back to the small size.
+            if w.frame.width > 900 || w.frame.height > 760 {
+                w.setContentSize(NSSize(width: 620, height: 440)); w.center()
+            }
             window = w
         }
         ReaderModel.shared.changed()
