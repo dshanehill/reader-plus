@@ -2,6 +2,17 @@
 
 ## Unreleased — responsiveness fixes (2026-11-13)
 
+### Command-click correction
+
+- Route Command-click through the same reading pipeline for Reader+'s own text and other apps' text. The previous special case could silently pass or discard a click based on Reader+'s window geometry, including when its window was covered by another app.
+- Keep Command-click working when Shift, Control (used for magnification), or Option is also held in the normal Command-click mode. Explicit Off and Option-Command modes remain respected.
+- Use screen-text recognition automatically if a clicked app's accessibility lookup times out, instead of abandoning the reading request.
+- Recognize text children inside controls rather than skipping the clicked label.
+- Use active-app state and window order for the remaining direct-window check, ignoring click-through windows.
+
+Validation: the actual callback passes a regression case where the own-window helper reports a Reader+ window with no direct text view; it must still capture and deliver the reading request. Modifier combinations, cancellation, paragraph boundaries, paired native-selection events, replay prevention, and deadlines also pass controlled transport tests. These tests do not establish physical mouse behavior in every application.
+
+
 - Move accessibility queries out of the mouse-event callback so a slow target app does not block click processing.
 - Reuse the system speech engine, wait for stop acknowledgement before replacement speech, and read paragraphs without recreating the engine between them.
 - Cancel superseded text/OCR requests, including requests stopped before speech begins.

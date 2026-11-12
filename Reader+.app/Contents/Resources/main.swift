@@ -1224,7 +1224,10 @@ func readSourceAt(_ p: CGPoint, hitElement: AXUIElement? = nil) -> ReadSource? {
 
     // Buttons, boxes, checkboxes, menus and the like: say what they are, like "Subscribe, button".
     let hitRole = axString(hit, "AXRole") ?? ""
-    if controlRoles.contains(hitRole) && hitRole != "AXLink" {
+    if (controlRoles.contains(hitRole) && hitRole != "AXLink") || chain.prefix(4).contains(where: {
+        let role = axString($0, "AXRole") ?? ""
+        return controlRoles.contains(role) && role != "AXLink"
+    }) {
         if let t = textAt(p), !t.text.trimmed.isEmpty { return ReadSource(text: t.text, element: nil, base: 0) }
     }
     // Lists where ⌘-click selects (Finder, Mail, the Dock…): read just that item.
@@ -1458,8 +1461,13 @@ func collectText(_ root: AXUIElement) -> String {
 
 /// The text view in one of Reader+'s own windows at a screen point (AppKit coordinates), if any.
 /// Returns nil (no hit) when the point isn't over a Reader+ window at all.
-func ownWindowHit(_ cp: NSPoint) -> (inOwnWindow: Bool, textView: NSTextView?, index: Int) {
-    for w in NSApp.windows where w.isVisible && w !== Overlay.shared.win && w.frame.contains(cp) {
+func ownWindowHit(_ cp: NSPoint, applicationIsActive: Bool = NSApp.isActive,
+                  windows: [NSWindow]? = nil) -> (inOwnWindow: Bool, textView: NSTextView?, index: Int) {
+    // A window can be visible while covered by Chrome or another app. Its rectangle is not a hit.
+    // Only handle Reader+'s text directly while Reader+ is the active app. Otherwise let the
+    // normal background accessibility lookup read the actual foreground app at this point.
+    guard applicationIsActive else { return (false, nil, 0) }
+    for w in windows ?? NSApp.orderedWindows where w.isVisible && !w.ignoresMouseEvents && w.frame.contains(cp) {
         guard let cv = w.contentView, let frameView = cv.superview else { return (true, nil, 0) }
         let wp = w.convertPoint(fromScreen: cp)
         var v = frameView.hitTest(frameView.convert(wp, from: nil))
@@ -2227,8 +2235,8 @@ final class ClickReader {
 
     static func modifiersMatch(_ f: CGEventFlags) -> Bool {
         let mode = prefs.integer(forKey: Key.clickMode)
-        guard mode != 0, f.contains(.maskCommand), !f.contains(.maskControl), !f.contains(.maskShift) else { return false }
-        return mode == 2 ? f.contains(.maskAlternate) : !f.contains(.maskAlternate)
+        guard mode != 0, f.contains(.maskCommand) else { return false }
+        return mode != 2 || f.contains(.maskAlternate)
     }
 
     func read(at p: CGPoint, request: ReadRequest? = nil) {
@@ -2268,10 +2276,9 @@ final class ClickReader {
             DispatchQueue.main.async {
                 guard r.valid else { return }
                 if timedOut {
-                    self.pending = nil
-                    r.trace("text lookup deadline exceeded; incomplete text discarded")
-                    ReaderModel.shared.activity = "The app did not provide its text in time."
-                    say("That app is taking too long to provide its text. Please try again.")
+                    r.trace("text lookup deadline exceeded; reading screen text instead")
+                    ReaderModel.shared.activity = "Reading text from the screen…"
+                    ocrRead(CGRect(x: p.x - 450, y: p.y - 140, width: 900, height: 280), showWindow: showWindow, request: r)
                     return
                 }
                 if let s = src, !s.text.trimmed.isEmpty { self.deliver(s, request: r, showWindow: showWindow); return }
@@ -2304,24 +2311,6 @@ let clickTapCallback: CGEventTapCallBack = { _, type, event, _ in
         return Unmanaged.passUnretained(event)
     }
     if type == .leftMouseDown, ClickReader.modifiersMatch(event.flags) {
-        let p = event.location
-        let own = ownWindowHit(NSPoint(x: p.x, y: primaryHeight - p.y))
-        if own.inOwnWindow {
-            guard let tv = own.textView else { return Unmanaged.passUnretained(event) }
-            let ns = tv.string as NSString
-            guard ns.length > 0 else { return Unmanaged.passUnretained(event) }
-            let para = ns.paragraphRange(for: NSRange(location: min(own.index, ns.length - 1), length: 0))
-            ClickReader.shared.swallowUp = true
-            DispatchQueue.main.async {
-                if tv === ReaderWindow.shared.textView {
-                    Reading.shared.start(ReadSource(text: tv.string, element: nil, base: 0), from: para.location, showWindow: false)
-                } else {
-                    let r = prefs.integer(forKey: Key.paragraphMode) == 1 ? para : NSRange(location: para.location, length: ns.length - para.location)
-                    Reading.shared.start(ReadSource(text: ns.substring(with: r), element: nil, base: 0), showWindow: false)
-                }
-            }
-            return nil
-        }
         ClickReader.shared.capture(event)
         return nil
     }
