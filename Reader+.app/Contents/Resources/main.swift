@@ -27,7 +27,9 @@ import Security
 // MARK: - Log & settings
 
 let logURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Reader+.log")
+let logLock = NSLock()
 func log(_ s: String) {
+    logLock.lock(); defer { logLock.unlock() }   // one line at a time, even from several threads
     let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm:ss"
     let line = "\(f.string(from: Date())) \(s)\n"
     if let h = try? FileHandle(forWritingTo: logURL) { h.seekToEndOfFile(); h.write(line.data(using: .utf8)!); try? h.close() }
@@ -183,6 +185,232 @@ final class Eleven {
     }
 }
 
+// MARK: - Kokoro voices (free, natural AI voices that run on this Mac)
+
+let kokoroSetupScript = #"""
+#!/bin/bash
+# Installs the free Kokoro voices for Reader+. Run by Reader+ with this folder as $1.
+set -e
+D="$1"; cd "$D"
+step() { echo "STEP: $*"; }
+PY=""
+for c in /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11 /opt/homebrew/bin/python3.10 \
+         /usr/local/bin/python3.13 /usr/local/bin/python3.12 /usr/local/bin/python3.11 /usr/local/bin/python3.10 \
+         /Library/Frameworks/Python.framework/Versions/3.1[0-3]/bin/python3 \
+         /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+  [ -x "$c" ] || continue
+  if "$c" -c 'import sys; sys.exit(0 if (3,10) <= sys.version_info[:2] < (3,14) else 1)' 2>/dev/null; then PY="$c"; break; fi
+done
+rm -rf "$D/venv"
+if [ -n "$PY" ]; then
+  echo "Using $PY"
+  step "Setting up"
+  "$PY" -m venv "$D/venv"
+  step "Installing Kokoro"
+  "$D/venv/bin/python" -m pip install --quiet --upgrade pip
+  "$D/venv/bin/python" -m pip install --quiet kokoro-onnx numpy
+else
+  step "Getting Python"
+  if [ "$(uname -m)" = arm64 ]; then T=aarch64-apple-darwin; else T=x86_64-apple-darwin; fi
+  mkdir -p "$D/uv"
+  curl -fsSL --retry 3 "https://github.com/astral-sh/uv/releases/latest/download/uv-$T.tar.gz" | tar -xz -C "$D/uv" --strip-components 1
+  "$D/uv/uv" venv --python 3.12 "$D/venv"
+  step "Installing Kokoro"
+  "$D/uv/uv" pip install --python "$D/venv/bin/python" kokoro-onnx numpy
+fi
+step "Downloading the voices (about 330 MB)"
+for f in kokoro-v1.0.onnx voices-v1.0.bin; do
+  if [ ! -s "$f" ]; then
+    curl -fL --retry 3 -o "$f.part" "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/$f" \
+      || curl -fL --retry 3 -o "$f.part" "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1/$f"
+    mv "$f.part" "$f"
+  fi
+done
+step "Testing the voice"
+"$D/venv/bin/python" - <<'PYEOF'
+from kokoro_onnx import Kokoro
+k = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
+s, sr = k.create("Ready.", voice="af_heart", speed=1.0, lang="en-us")
+print("OK", len(s), sr)
+PYEOF
+touch "$D/installed"
+step "Done"
+"""#
+
+let kokoroServerScript = #"""
+# Reader+ Kokoro voice server. Listens only on this Mac (127.0.0.1).
+import sys, json, io, wave, threading
+import numpy as np
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from kokoro_onnx import Kokoro
+
+d, port = sys.argv[1], int(sys.argv[2])
+k = Kokoro(f"{d}/kokoro-v1.0.onnx", f"{d}/voices-v1.0.bin")
+lock = threading.Lock()
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def reply(self, code, body, kind):
+        self.send_response(code)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def do_GET(self):
+        if self.path == "/ping": self.reply(200, b"ok", "text/plain")
+        elif self.path == "/voices":
+            try: v = sorted(k.get_voices())
+            except Exception: v = []
+            self.reply(200, json.dumps(v).encode(), "application/json")
+        else: self.reply(404, b"", "text/plain")
+    def do_POST(self):
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            req = json.loads(self.rfile.read(n) or b"{}")
+            text = (req.get("text") or "").strip()
+            if not text: return self.reply(400, b"no text", "text/plain")
+            with lock:
+                samples, sr = k.create(text, voice=req.get("voice", "af_heart"),
+                                       speed=float(req.get("speed", 1.0)), lang=req.get("lang", "en-us"))
+            pcm = (np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes()
+            buf = io.BytesIO()
+            w = wave.open(buf, "wb"); w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr); w.writeframes(pcm); w.close()
+            self.reply(200, buf.getvalue(), "audio/wav")
+        except Exception as e:
+            self.reply(500, str(e).encode(), "text/plain")
+
+ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
+"""#
+
+final class Kokoro {
+    static let shared = Kokoro()
+    static let prefix = "kokoro:"
+    let port = 59125
+    var dir: URL { FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Reader+/Kokoro") }
+    var isInstalled: Bool { FileManager.default.fileExists(atPath: dir.appendingPathComponent("installed").path) }
+    private(set) var installing = false
+    private var server: Process?
+    private var ready = false
+    private let startLock = NSLock()
+    /// The most natural English voices, with friendly names.
+    let voices: [(id: String, name: String)] = [
+        ("af_heart", "Heart (American woman)"), ("af_bella", "Bella (American woman)"), ("af_nicole", "Nicole (American woman, soft)"),
+        ("af_sarah", "Sarah (American woman)"), ("af_sky", "Sky (American woman)"), ("am_michael", "Michael (American man)"),
+        ("am_fenrir", "Fenrir (American man)"), ("am_puck", "Puck (American man)"), ("am_adam", "Adam (American man)"),
+        ("bf_emma", "Emma (British woman)"), ("bf_isabella", "Isabella (British woman)"), ("bm_george", "George (British man)"),
+        ("bm_fable", "Fable (British man)"),
+    ]
+    /// Reader+ speed (0.1–1.0, 0.5 normal) as Kokoro speed (1.0 normal).
+    var speed: Double { max(0.6, min(1.8, prefs.double(forKey: Key.rate) / 0.5)) }
+
+    private func writeScripts() {
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? kokoroSetupScript.write(to: dir.appendingPathComponent("setup.sh"), atomically: true, encoding: .utf8)
+        try? kokoroServerScript.write(to: dir.appendingPathComponent("server.py"), atomically: true, encoding: .utf8)
+    }
+
+    func install(_ update: @escaping (String) -> Void, _ done: @escaping (Bool) -> Void) {
+        guard !installing else { return }
+        installing = true
+        writeScripts()
+        try? FileManager.default.removeItem(at: dir.appendingPathComponent("installed"))
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = [dir.appendingPathComponent("setup.sh").path, dir.path]
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        p.environment = env
+        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = pipe
+        let logURL = dir.appendingPathComponent("install.log")
+        FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        let fh = try? FileHandle(forWritingTo: logURL)
+        pipe.fileHandleForReading.readabilityHandler = { h in
+            let d = h.availableData
+            guard !d.isEmpty else { return }
+            fh?.write(d)
+            if let text = String(data: d, encoding: .utf8) {
+                for line in text.split(separator: "\n") where line.hasPrefix("STEP: ") {
+                    let t = String(line.dropFirst(6))
+                    log("Kokoro: \(t)")
+                    DispatchQueue.main.async { update(t) }
+                }
+            }
+        }
+        p.terminationHandler = { pr in
+            pipe.fileHandleForReading.readabilityHandler = nil
+            try? fh?.close()
+            DispatchQueue.main.async {
+                self.installing = false
+                let ok = pr.terminationStatus == 0 && self.isInstalled
+                log("Kokoro install " + (ok ? "finished" : "failed (\(pr.terminationStatus)); see \(logURL.path)"))
+                done(ok)
+            }
+        }
+        do { try p.run(); log("Kokoro install started") } catch { installing = false; done(false) }
+    }
+
+    private func ping() -> Bool {
+        var r = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/ping")!); r.timeoutInterval = 1
+        let sem = DispatchSemaphore(value: 0); var ok = false
+        URLSession.shared.dataTask(with: r) { _, resp, _ in ok = (resp as? HTTPURLResponse)?.statusCode == 200; sem.signal() }.resume()
+        _ = sem.wait(timeout: .now() + 2)
+        return ok
+    }
+
+    /// Starts the voice in the background if needed (takes a few seconds the first time).
+    private func ensureServer() -> Bool {
+        startLock.lock(); defer { startLock.unlock() }
+        if ready && ping() { return true }
+        ready = false
+        if ping() { ready = true; return true }
+        if server == nil || !(server!.isRunning) {
+            writeScripts()
+            let p = Process()
+            p.executableURL = dir.appendingPathComponent("venv/bin/python")
+            p.arguments = [dir.appendingPathComponent("server.py").path, dir.path, String(port)]
+            p.currentDirectoryURL = dir
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle(forWritingAtPath: dir.appendingPathComponent("server.log").path) ?? FileHandle.nullDevice
+            FileManager.default.createFile(atPath: dir.appendingPathComponent("server.log").path, contents: nil)
+            do { try p.run(); server = p; log("Kokoro voice starting") } catch { log("Kokoro couldn't start: \(error)"); return false }
+        }
+        for _ in 0..<120 { if ping() { ready = true; log("Kokoro voice ready"); return true }; usleep(500_000) }
+        return false
+    }
+
+    func warmUp() { guard isInstalled else { return }; DispatchQueue.global(qos: .utility).async { _ = self.ensureServer() } }
+    func stopServer() { server?.terminate(); server = nil; ready = false }
+
+    func speech(_ text: String, voice: String, _ done: @escaping (Data?, [ElevenWord], String?) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard self.ensureServer() else { done(nil, [], "Kokoro didn't start"); return }
+            var r = URLRequest(url: URL(string: "http://127.0.0.1:\(self.port)/speak")!)
+            r.httpMethod = "POST"; r.timeoutInterval = 90
+            r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            let lang = voice.hasPrefix("b") ? "en-gb" : "en-us"
+            r.httpBody = try? JSONSerialization.data(withJSONObject: ["text": text, "voice": voice, "speed": self.speed, "lang": lang])
+            URLSession.shared.dataTask(with: r) { data, resp, err in
+                if let err = err { self.ready = false; done(nil, [], err.localizedDescription); return }
+                guard (resp as? HTTPURLResponse)?.statusCode == 200, let d = data else {
+                    done(nil, [], "Kokoro error " + (data.flatMap { String(data: $0, encoding: .utf8) } ?? "")); return
+                }
+                done(d, [], nil)
+            }.resume()
+        }
+    }
+}
+
+/// When a voice gives no word timings, estimate them from where each word sits in the text.
+func estimateWords(_ text: String, duration: Double) -> [ElevenWord] {
+    let ns = text as NSString
+    guard ns.length > 0, duration > 0 else { return [] }
+    var out: [ElevenWord] = []
+    ns.enumerateSubstrings(in: NSRange(location: 0, length: ns.length), options: .byWords) { _, r, _, _ in
+        out.append(ElevenWord(loc: r.location, len: r.length, start: duration * 0.97 * Double(r.location) / Double(ns.length)))
+    }
+    return out
+}
+
 /// Speaks with either a voice picked in Reader+ (AVSpeechSynthesizer), or the Mac's System Voice
 /// from System Settings > Accessibility > Spoken Content, which can be a Siri voice (NSSpeechSynthesizer).
 final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerDelegate, AVAudioPlayerDelegate {
@@ -216,9 +444,12 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
     /// "Siri / System Voice" is chosen (no Reader+ voice picked).
     var useSystemVoice: Bool { (prefs.string(forKey: Key.voice) ?? "").isEmpty }
     /// The ElevenLabs voice ID, when an ElevenLabs voice is chosen and a key is saved.
+    /// The chosen ElevenLabs or Kokoro voice ("eleven:ID" / "kokoro:ID"), when it can be used.
     var elevenVoice: String? {
-        guard let v = prefs.string(forKey: Key.voice), v.hasPrefix(Eleven.prefix), Eleven.shared.hasKey else { return nil }
-        return String(v.dropFirst(Eleven.prefix.count))
+        guard let v = prefs.string(forKey: Key.voice) else { return nil }
+        if v.hasPrefix(Eleven.prefix) && Eleven.shared.hasKey { return v }
+        if v.hasPrefix(Kokoro.prefix) && Kokoro.shared.isInstalled { return v }
+        return nil
     }
     var isReading: Bool { lastPiece != nil || sysReading || elReading }
     var isPaused: Bool { synth.isPaused || sysPaused || elPaused }
@@ -317,13 +548,18 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
     private func fetchEleven(_ off: Int, _ text: String, _ voiceID: String, _ gen: Int) {
         guard elCache[off] == nil else { return }
         elCache[off] = (nil, [], "pending")
-        Eleven.shared.speech(text, voice: voiceID) { audio, words, err in
+        let finished: (Data?, [ElevenWord], String?) -> Void = { audio, words, err in
             DispatchQueue.main.async {
                 guard gen == self.elGen else { return }
                 let r = (audio, words, err)
                 self.elCache[off] = r
                 if let w = self.elWaiting.removeValue(forKey: off) { w(audio, words, err) }
             }
+        }
+        if voiceID.hasPrefix(Kokoro.prefix) {
+            Kokoro.shared.speech(text, voice: String(voiceID.dropFirst(Kokoro.prefix.count)), finished)
+        } else {
+            Eleven.shared.speech(text, voice: String(voiceID.dropFirst(Eleven.prefix.count)), finished)
         }
     }
 
@@ -335,14 +571,15 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
             guard gen == self.elGen, self.elReading else { return }
             guard let a = audio, let player = try? AVAudioPlayer(data: a) else {
                 // ElevenLabs couldn't be reached: carry on with an Apple voice from here.
-                log("ElevenLabs failed (\(err ?? "no audio")); using an Apple voice")
+                log("\(voiceID.hasPrefix(Kokoro.prefix) ? "Kokoro" : "ElevenLabs") failed (\(err ?? "no audio")); using an Apple voice")
                 let rest = [(off, text)] + self.elQueue
                 self.elReading = false; self.elQueue = []
                 self.speakApple(rest)
                 return
             }
             self.elPlayer = player; player.delegate = self
-            self.elWords = words; self.elOffset = off; self.elLastWord = -1
+            self.elWords = words.isEmpty ? estimateWords(text, duration: player.duration) : words
+            self.elOffset = off; self.elLastWord = -1
             player.prepareToPlay(); player.play()
             self.elTimer?.invalidate()
             self.elTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in self.elevenTick() }
@@ -2258,6 +2495,23 @@ struct VoicePane: View {
     @State private var keyField = ""
     @State private var elStatus = ""
     @State private var busy = false
+    @State private var koBusy = Kokoro.shared.installing
+    @State private var koStatus = ""
+    func installKokoro() {
+        koBusy = true; koStatus = "Starting the install…"
+        Kokoro.shared.install({ if koBusy { koStatus = $0 + "…" } }) { ok in
+            koBusy = false
+            if ok {
+                koStatus = "Installed. Heart is now your voice; pick another Kokoro voice above if you like."
+                prefs.set(Kokoro.prefix + "af_heart", forKey: Key.voice)
+                Kokoro.shared.warmUp()
+                sample("Hi, I'm Heart, one of your new Kokoro voices. I run right here on your Mac.")
+            } else {
+                koStatus = "The install didn't finish. Check your internet connection and try again."
+            }
+            model.changed()
+        }
+    }
     func loadVoices() {
         busy = true; elStatus = "Loading your ElevenLabs voices…"
         Eleven.shared.loadVoices { err in
@@ -2281,6 +2535,10 @@ struct VoicePane: View {
                         if Speaker.shared.isReading { Reading.shared.restartHere() } else { sample("This is my voice.") }
                     })) {
                     Text("Siri / System Voice").tag("")
+                    if Kokoro.shared.isInstalled {
+                        Divider()
+                        ForEach(Kokoro.shared.voices, id: \.id) { v in Text("\(v.name) (Kokoro)").tag(Kokoro.prefix + v.id) }
+                    }
                     if Eleven.shared.hasKey && !Eleven.shared.voices.isEmpty {
                         Divider()
                         ForEach(Eleven.shared.voices, id: \.id) { v in Text("\(v.name) (ElevenLabs)").tag(Eleven.prefix + v.id) }
@@ -2309,6 +2567,19 @@ struct VoicePane: View {
                 }
             } footer: {
                 Text("Siri / System Voice speaks with the voice chosen in System Settings, Accessibility, Spoken Content. Pick a Siri voice there and Reader+ uses it. The other voices are the ones VoiceOver uses; Enhanced and Premium sound the most natural.")
+                    .foregroundStyle(.secondary)
+            }
+            Section {
+                if Kokoro.shared.isInstalled && !koBusy {
+                    LabeledContent("Kokoro") { Label("Installed", systemImage: "checkmark.seal.fill").foregroundStyle(.green) }
+                } else {
+                    LabeledContent("Kokoro") {
+                        Button(koBusy ? "Installing…" : "Install Kokoro Voices") { installKokoro() }.disabled(koBusy)
+                    }
+                }
+                if !koStatus.isEmpty { Text(koStatus).foregroundStyle(.secondary) }
+            } header: { Text("Kokoro Voices (free, on your Mac)") } footer: {
+                Text("Free, natural-sounding AI voices that run on your Mac: no account, no limits, and nothing you read is sent anywhere. The one-time install downloads about 400 MB. Right after Reader+ starts, the first reading can take a few seconds while the voice loads.")
                     .foregroundStyle(.secondary)
             }
             Section {
@@ -2485,6 +2756,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buildMenu()
         buildMainMenu()
         ClickReader.shared.start()
+        if (prefs.string(forKey: Key.voice) ?? "").hasPrefix(Kokoro.prefix) { Kokoro.shared.warmUp() }
         MouseEcho.shared.apply()
         KeyEcho.shared.startTap()
         log("started; accessibility \(AXIsProcessTrusted() ? "on" : "off"), keyboard \(CGPreflightListenEventAccess() ? "on" : "off"), screen \(CGPreflightScreenCaptureAccess() ? "on" : "off")")
@@ -2509,6 +2781,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    func applicationWillTerminate(_ n: Notification) { Kokoro.shared.stopServer() }
 
     func buildMainMenu() {
         let main = NSMenu()
@@ -2693,6 +2967,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let sys = NSMenuItem(title: "Siri / System Voice", action: #selector(pickVoice(_:)), keyEquivalent: "")
         sys.target = self; sys.representedObject = ""; sys.state = current == nil ? .on : .off
         vm.addItem(sys); vm.addItem(.separator())
+        if Kokoro.shared.isInstalled {
+            for kv in Kokoro.shared.voices {
+                let ki = NSMenuItem(title: "\(kv.name) (Kokoro)", action: #selector(pickVoice(_:)), keyEquivalent: "")
+                ki.target = self; ki.representedObject = Kokoro.prefix + kv.id; ki.state = current == Kokoro.prefix + kv.id ? .on : .off
+                vm.addItem(ki)
+            }
+            vm.addItem(.separator())
+        }
         if Eleven.shared.hasKey && !Eleven.shared.voices.isEmpty {
             for ev in Eleven.shared.voices {
                 let ei = NSMenuItem(title: "\(ev.name) (ElevenLabs)", action: #selector(pickVoice(_:)), keyEquivalent: "")
@@ -2744,6 +3026,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func pickVoice(_ s: NSMenuItem) {
         guard let id = s.representedObject as? String else { return }
         if id.isEmpty { prefs.removeObject(forKey: Key.voice) } else { prefs.set(id, forKey: Key.voice) }
+        if id.hasPrefix(Kokoro.prefix) { Kokoro.shared.warmUp() }
         if Speaker.shared.isReading { Reading.shared.restartHere() } else { sample("This is my voice.") }
     }
     @objc func moreVoices() {
