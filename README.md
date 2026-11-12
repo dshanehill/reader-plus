@@ -6,11 +6,9 @@ Reader+ reads your screen aloud with your Mac's own voices, the same voices Voic
 
 ## Why Reader+ exists
 
-Reader+ was created by **Shane** ([@dshanehill](https://github.com/dshanehill)), who is legally blind. Originally from Dallas, Texas, Shane lives as an expat in Cebu Business Park, Cebu City, Philippines.
+macOS has a great magnifier and a full screen reader, VoiceOver, but nothing in between. Many partially sighted people can see the screen with magnification and just want help *reading* it: an article, a long Facebook post, the words in a picture. VoiceOver takes over the whole Mac to do that. Reader+ doesn't.
 
-He built Reader+ because macOS has a great magnifier and a full screen reader, VoiceOver, but nothing in between. Many partially sighted people can see the screen with magnification and just want help *reading* it: an article, a long Facebook post, the words in a picture. VoiceOver takes over the whole Mac to do that. Reader+ doesn't.
-
-Shane shares Reader+ freely to help the partially sighted and low-vision community. If it helps you, pass it on.
+Reader+ is shared freely to help the partially sighted and low-vision community. If it helps you, pass it on.
 
 ## What it does
 
