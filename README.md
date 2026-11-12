@@ -12,39 +12,34 @@ Reader+ is shared freely to help the partially sighted and low-vision community.
 
 ## What it does
 
+Reader+ is made for the mouse. There's no list of keyboard shortcuts to learn: you hold **Command** and use your mouse. If you want lots of keyboard commands, that's what VoiceOver is for.
+
 - **⌘-click to read by headings and paragraphs.** Click a heading to hear it and everything under it, up to the next heading. Click a paragraph to hear the article from there, or just that paragraph if you prefer.
 - **Whole posts on social media.** On Facebook, Instagram, X, Threads, LinkedIn, Reddit and similar sites, ⌘-click a post. Reader+ presses *See more* for you and reads the entire post. It skips the Like, Comment and Share buttons.
-- **Words in pictures (OCR).** ⌘-click a screenshot, meme or scanned page to hear the words in it. Control-Option-O reads everything in the window under your pointer, even in apps with no real text. It uses the Mac's built-in text recognition, so nothing leaves your computer.
-- **Read what you select.** Select text in any app and press Control-Option-S.
-- **Read a whole page.** Control-Option-R reads from your cursor, or the whole page if there's no cursor. While it reads, Control-Option with the arrow keys jumps by paragraph (left and right) and by heading (up and down).
+- **Words in pictures (OCR).** ⌘-click a screenshot, meme or scanned page to hear the words in it. It uses the Mac's built-in text recognition, so nothing leaves your computer.
+- **Read a whole page.** ⌘-right-click anywhere on a page or window to hear all of it from the top. If it has no real text, Reader+ reads the words it sees on screen.
+- **Pause, move and change speed with the mouse.** While Reader+ is talking, ⌘-right-click pauses and resumes, ⌘ with your mouse's Back and Forward side buttons moves by paragraph, and ⌘ with the scroll wheel makes speech faster (up) or slower (down).
+- **Stop with Control, just like VoiceOver.** Tap the Control key by itself to stop talking.
 - **Mouse Echo.** Rest the pointer on a button, menu, link or line of text to hear it, for example "Save, button".
 - **Key Echo.** Hear the characters, the words, or both as you type.
 - **Reading window.** Big, high-contrast text, with the word being spoken highlighted. There are five color schemes and adjustable size.
 - **Outline on screen.** The paragraph being read gets a yellow outline on the page itself.
-- **Stop with Control, just like VoiceOver.** Tap the Control key by itself to stop talking. Control-Option with = and − makes speech faster or slower, and Control-Option-P pauses if you want to pick up where you left off.
-- **Guided tour.** A spoken, step-by-step tour runs the first time you open Reader+. Control-Option-T opens it again.
+- **Guided tour.** A spoken, step-by-step tour runs the first time you open Reader+.
 
-## Keyboard shortcuts
+Mouse Echo, Key Echo, the reading window, voices, reading selected text or the clipboard, and the tour are all in the Reader+ window and the Reader+ icon in the menu bar.
 
-All shortcuts use **Control + Option** (⌃⌥), like VoiceOver.
+## Mouse commands
 
-| Shortcut | What it does |
+| Do this | What happens |
 |---|---|
-| ⌘-click | Read by headings and paragraphs, a whole social media post, or the words in a picture |
-| ⌃⌥ S | Read selected text |
-| ⌃⌥ R | Read from the cursor, or the whole page |
-| ⌃⌥ V | Read the clipboard |
-| ⌃⌥ O | Read the words in the window under the pointer (OCR) |
+| ⌘-click | Read a heading and its section, a paragraph onward, a whole social media post, or the words in a picture |
+| ⌘-right-click | Read the whole page or window |
+| ⌘-right-click while reading | Pause or resume |
+| ⌘ + mouse Back / Forward button | Previous / next paragraph |
+| ⌘ + scroll up / down | Faster / slower |
 | Tap ⌃ Control | Stop talking, like VoiceOver |
-| ⌃⌥ P | Pause or resume |
-| ⌃⌥ = and ⌃⌥ − | Faster and slower |
-| ⌃⌥ → and ⌃⌥ ← | Next and previous paragraph |
-| ⌃⌥ ↓ and ⌃⌥ ↑ | Next and previous heading |
-| ⌃⌥ M | Mouse Echo on or off |
-| ⌃⌥ K | Key Echo: off, characters, words, both |
-| ⌃⌥ W | Show or hide the reading window |
-| ⌃⌥ H | Spoken help |
-| ⌃⌥ T | Guided tour |
+
+If you choose ⌥⌘-Click in the settings, hold Option as well.
 
 ## Install
 
