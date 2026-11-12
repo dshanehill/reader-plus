@@ -1406,7 +1406,7 @@ final class Overlay {
         win.contentView = HighlightView()
     }
     func show(axRect r: CGRect, for seconds: Double? = nil) {
-        guard prefs.bool(forKey: Key.screenHighlight), r.width > 0, r.height > 0, r.width < 1400, r.height < 70 else { hide(); return }
+        guard prefs.bool(forKey: Key.screenHighlight), r.width > 0, r.height > 0, r.width < 2400, r.height < (NSScreen.main?.frame.height ?? 1000) * 0.85 else { hide(); return }
         win.setFrame(cocoaRect(r).insetBy(dx: -4, dy: -3), display: true)
         win.orderFrontRegardless()
         hideWork?.cancel()
@@ -1586,7 +1586,7 @@ final class Reading {
         let ns = src.text as NSString
         offset = max(0, min(from, ns.length))
         lastWord = NSRange(location: offset, length: 0)
-        currentBlock = -1
+        currentBlock = -1; lastParagraph = -1; lastLine = -1
         if showWindow && prefs.bool(forKey: Key.showReader) && ns.length > 60 { ReaderWindow.shared.show(src.text) }
         ReaderWindow.shared.setPlaying(true)
         Speaker.shared.say(ns.substring(from: offset), track: true)
@@ -1597,9 +1597,16 @@ final class Reading {
         lastWord = full
         if ReaderWindow.shared.isVisible { ReaderWindow.shared.highlight(full) }
         guard let src = source else { return }
-        if let e = src.element,
-           let rect = axRectValue(axParam(e, "AXBoundsForRange", makeRange(src.base + full.location, full.length))) {
-            Overlay.shared.show(axRect: rect)
+        if let e = src.element {
+            let ns = src.text as NSString
+            guard full.location < ns.length else { return }
+            let para = ns.paragraphRange(for: NSRange(location: full.location, length: 0))
+            if para.location != lastParagraph {
+                lastParagraph = para.location
+                if let rect = axRectValue(axParam(e, "AXBoundsForRange", makeRange(src.base + para.location, max(1, para.length)))) {
+                    Overlay.shared.show(axRect: rect)
+                }
+            }
         } else if let bi = blockIndex(at: full.location) {
             if bi != currentBlock {
                 // A new paragraph: bring it on screen and learn its size and line height.
@@ -1625,21 +1632,24 @@ final class Reading {
     var blockLineHeight: CGFloat = 22
     var lastLine = -1
 
+    var lastParagraph = -1
+    var lastFrameCheck = Date.distantPast
+
     func followLine(_ full: NSRange) {
         guard let src = source, currentBlock >= 0, currentBlock < src.blocks.count, let f = blockFrame else { return }
-        let b = src.blocks[currentBlock].range
-        let frac = Double(max(0, full.location - b.location)) / Double(max(1, b.length))
-        let lines = max(1, Int((f.height / blockLineHeight).rounded()))
-        let line = min(lines - 1, max(0, Int(frac * Double(lines))))
-        guard line != lastLine else { return }
-        lastLine = line
-        let h = f.height / CGFloat(lines)
-        Overlay.shared.show(axRect: CGRect(x: f.minX, y: f.minY + CGFloat(line) * h, width: f.width, height: h))
-        // If the page was scrolled, keep the outline in the right place.
+        if lastLine != currentBlock {
+            lastLine = currentBlock
+            Overlay.shared.show(axRect: f)
+        }
+        // If the page was scrolled, move the outline with the paragraph (checked twice a second).
+        guard Date().timeIntervalSince(lastFrameCheck) > 0.5 else { return }
+        lastFrameCheck = Date()
         let el = src.blocks[currentBlock].element, bi = currentBlock
         DispatchQueue.global(qos: .utility).async {
-            if let nf = axFrame(el), nf.origin != f.origin {
-                DispatchQueue.main.async { if self.currentBlock == bi { self.blockFrame = nf; self.lastLine = -1; self.followLine(self.lastWord) } }
+            if let nf = axFrame(el), nf != f {
+                DispatchQueue.main.async {
+                    if self.currentBlock == bi { self.blockFrame = nf; Overlay.shared.show(axRect: nf) }
+                }
             }
         }
     }
