@@ -6,7 +6,7 @@ if [ "$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then ARCH=a
 RES="$HERE/../Resources"
 BIN="$HERE/ReaderPlus"
 LOG="$HOME/Library/Logs/Reader+.log"
-HASH="$ARCH-$(/sbin/md5 -q "$RES/main.swift")"
+HASH="$ARCH-sig2-$(/sbin/md5 -q "$RES/main.swift")"
 if [ ! -x "$BIN" ] || [ "$(cat "$RES/.build-hash" 2>/dev/null)" != "$HASH" ]; then
   echo "$(date '+%F %T') building…" >> "$LOG"
   if ! /usr/bin/xcrun swiftc -O -swift-version 5 -target "$ARCH-apple-macos13.0" \
@@ -17,7 +17,8 @@ if [ ! -x "$BIN" ] || [ "$(cat "$RES/.build-hash" 2>/dev/null)" != "$HASH" ]; th
     exit 1
   fi
   mv -f "$BIN.new" "$BIN"
-  /usr/bin/codesign --force --sign - --identifier local.shane.ReaderPlus "$BIN" >/dev/null 2>&1 || true
+  /usr/bin/codesign --force --sign - --identifier local.shane.ReaderPlus -r='designated => identifier "local.shane.ReaderPlus"' "$BIN" >> "$LOG" 2>&1 || true
+  /usr/bin/codesign -d -r- "$BIN" >> "$LOG" 2>&1 || true
   echo "$HASH" > "$RES/.build-hash"
   echo "$(date '+%F %T') build done" >> "$LOG"
 fi
