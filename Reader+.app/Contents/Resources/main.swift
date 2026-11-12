@@ -8,7 +8,7 @@
 //                          article from there (or just that paragraph). A social media post is read in full,
 //                          and a picture has its words read (OCR).
 //   ⌘-right-click          Read the whole page or window under the pointer (OCR if it has no real text).
-//                          While Reader+ is talking, it pauses and resumes instead.
+//                          While Reader+ is talking, it stops instead.
 //   ⌘ + Back / Forward     Previous / next paragraph (the side buttons on a mouse), while reading.
 //   ⌘ + scroll wheel       Faster (up) / slower (down), while reading.
 //   Tap Control            Stop talking, like VoiceOver.
@@ -166,6 +166,20 @@ func frontAppElement() -> AXUIElement? {
     AXUIElementSetMessagingTimeout(e, 1.5)
     return e
 }
+
+var exposedPIDs = Set<pid_t>()
+/// Chromium and Electron apps (Chrome, Claude, ChatGPT, Slack, Discord…) only share their page text with
+/// assistive apps once asked. VoiceOver asks automatically; Reader+ asks here.
+func exposeText(_ pid: pid_t) {
+    guard pid != ProcessInfo.processInfo.processIdentifier, !exposedPIDs.contains(pid) else { return }
+    exposedPIDs.insert(pid)
+    let e = AXUIElementCreateApplication(pid)
+    AXUIElementSetMessagingTimeout(e, 0.5)
+    AXUIElementSetAttributeValue(e, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+}
+
+/// Roles where ⌘-click means something else (selecting several files, rows or list items).
+let selectionRoles: Set<String> = ["AXOutline", "AXTable", "AXList", "AXBrowser", "AXRow", "AXCell", "AXMenu", "AXMenuBar", "AXToolbar"]
 
 // Screen coordinates: AX uses a top-left origin, AppKit a bottom-left one.
 var primaryHeight: CGFloat { NSScreen.screens.first?.frame.height ?? 0 }
@@ -334,6 +348,16 @@ func readSourceAt(_ p: CGPoint) -> ReadSource? {
 
     // Web pages: headings and paragraphs.
     guard let web = chain.first(where: { axString($0, "AXRole") == "AXWebArea" }) else {
+        // Native apps (for example a chat app's replies): read from the clicked paragraph onward.
+        if let area = chain.first(where: { axString($0, "AXRole") == "AXScrollArea" }) {
+            let blocks = collectBlocks(area)
+            if !blocks.isEmpty {
+                var index: Int? = nil
+                for a in chain { if let i = blocks.firstIndex(where: { CFEqual($0.element, a) }) { index = i; break } }
+                if index == nil { index = blocks.firstIndex(where: { axFrame($0.element)?.contains(p) ?? false }) }
+                if let i = index { return sourceFromBlocks(blocks, start: i, sectionOnly: true, paragraphOnly: paragraphOnly) }
+            }
+        }
         if let t = textAt(p) { return ReadSource(text: t.text, element: nil, base: 0) }
         return nil
     }
@@ -451,13 +475,21 @@ func clickIsReadable(_ p: CGPoint) -> Bool {
     var found: AXUIElement?
     guard AXUIElementCopyElementAtPosition(systemWide, Float(p.x), Float(p.y), &found) == .success, let hit = found else { return false }
     AXUIElementSetMessagingTimeout(hit, 0.25)
-    if axString(hit, "AXRole") == "AXImage" { return true }
-    var cur: AXUIElement? = hit; var n = 0
+    var pid: pid_t = 0
+    if AXUIElementGetPid(hit, &pid) == .success { exposeText(pid) }
+    let hitRole = axString(hit, "AXRole") ?? ""
+    if hitRole == "AXImage" { return true }
+    var cur: AXUIElement? = hit; var n = 0; var inScroll = false
     while let c = cur, n < 40 {
         let r = axString(c, "AXRole") ?? ""
         if r == "AXLink" || r == "AXButton" || r == "AXTextField" { return false }
         if r == "AXWebArea" || r == "AXTextArea" { return true }
-        if r == "AXWindow" || r == "AXApplication" { return false }
+        if selectionRoles.contains(r) { return false }
+        if r == "AXScrollArea" { inScroll = true }
+        if r == "AXWindow" || r == "AXApplication" {
+            // Native apps (like a chat app's messages): text inside a scrolling area can be read.
+            return inScroll && (hitRole == "AXStaticText" || hitRole == "AXGroup")
+        }
         cur = axElement(c, "AXParent"); n += 1
     }
     return false
@@ -620,7 +652,7 @@ final class ReaderWindow: NSObject, NSWindowDelegate {
     func build() {
         let screen = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }) ?? NSScreen.main!
         let vf = screen.visibleFrame
-        let size = NSSize(width: min(1000, vf.width * 0.8), height: min(560, vf.height * 0.6))
+        let size = NSSize(width: min(760, vf.width * 0.6), height: min(440, vf.height * 0.5))
         let p = NSPanel(contentRect: NSRect(x: vf.midX - size.width / 2, y: vf.midY - size.height / 2, width: size.width, height: size.height),
                         styleMask: [.titled, .closable, .resizable, .utilityWindow], backing: .buffered, defer: false)
         p.title = "Reading Window"
@@ -628,7 +660,14 @@ final class ReaderWindow: NSObject, NSWindowDelegate {
         p.hidesOnDeactivate = false
         p.isReleasedWhenClosed = false
         p.delegate = self
-        p.setFrameAutosaveName("ReaderPlusWindow")
+        // A modest window that never fills the screen.
+        p.collectionBehavior = [.fullScreenNone]
+        p.contentMinSize = NSSize(width: 420, height: 260)
+        p.contentMaxSize = NSSize(width: 1100, height: 700)
+        p.setFrameAutosaveName("ReaderPlusReadingSmall")
+        if p.frame.width > 1120 || p.frame.height > 760 {
+            p.setContentSize(size); p.center()
+        }
 
         let content = NSView(frame: p.contentLayoutRect)
         content.autoresizingMask = [.width, .height]
@@ -1161,14 +1200,16 @@ let clickTapCallback: CGEventTapCallBack = { _, type, event, _ in
     }
     let cr = ClickReader.shared
     let talking = Speaker.shared.isReading
-    // ⌘-right-click: pause / resume while talking, otherwise read the whole page or window.
+    // ⌘-right-click: stop while talking, otherwise read the whole page or window.
     if type == .rightMouseDown, ClickReader.modifiersMatch(event.flags) {
         let p = event.location
-        if talking {
+        if talking || Speaker.shared.synth.isSpeaking {
             cr.swallowRightUp = true
             DispatchQueue.main.async {
-                Speaker.shared.pauseOrResume()
-                ReaderWindow.shared.setPlaying(!Speaker.shared.isPaused && Speaker.shared.isReading)
+                Speaker.shared.stop()
+                Overlay.shared.hide()
+                ReaderWindow.shared.setPlaying(false)
+                log("stopped by Command right-click")
             }
             return nil
         }
@@ -1247,7 +1288,7 @@ let slides: [Slide] = [
           body: "macOS keeps apps from reading other apps' text unless you allow it.\n\nAccessibility lets Reader+ see the words in Safari, Chrome, Mail and your other apps, and notice your Command-clicks. Screen Recording lets Reader+ read the words in pictures. Input Monitoring is only needed for Key Echo.",
           permissions: true),
     Slide(symbol: "list.bullet.indent", color: rgb(0.6, 0.35, 0.95), title: "⌘-click to read",
-          body: "Hold Command and click a heading to hear that heading and everything under it, up to the next heading. Command-click a paragraph to hear the article from there to the end.\n\nThis works because web pages label their headings and paragraphs for accessibility, so Reader+ can follow an article the way it was written. Command-clicking a link still opens it as usual.",
+          body: "Hold Command and click a heading to hear that heading and everything under it, up to the next heading. Command-click a paragraph to hear everything from there to the end, without stopping. This works in AI chat apps too, so you can hear a whole reply.\n\nThis works because web pages label their headings and paragraphs for accessibility, so Reader+ can follow an article the way it was written. Command-clicking a link still opens it as usual.",
           keys: ["⌘ Command", "Click"], spokenKeys: "Command click",
           practice: "Try it. Hold Command and click this paragraph. Reader+ reads from here to the end of this box.\n\nThis is the second paragraph. Reading carries on into it by itself.\n\nAnd here's a third paragraph, so you can hear it keep going."),
     Slide(symbol: "bubble.left.and.text.bubble.right.fill", color: rgb(0.25, 0.45, 0.95), title: "Whole posts on social media",
@@ -1257,7 +1298,7 @@ let slides: [Slide] = [
           body: "Command-click a picture, like a screenshot, a meme or a scanned page, and Reader+ reads the words in it. It uses the text recognition built into your Mac, so nothing leaves your computer.",
           keys: ["⌘ Command", "Click"], spokenKeys: "Command click"),
     Slide(symbol: "doc.text.magnifyingglass", color: rgb(0.1, 0.65, 0.7), title: "Read a whole page",
-          body: "Hold Command and right-click anywhere on a page or window to hear all of it from the top. If it has no real text, Reader+ reads the words it sees on the screen instead.\n\nWhile Reader+ is talking, Command right-click pauses, and doing it again carries on.",
+          body: "Hold Command and right-click anywhere on a page or window to hear all of it from the top. If it has no real text, Reader+ reads the words it sees on the screen instead.\n\nWhile Reader+ is talking, Command right-click stops it. Tapping the Control key stops it too.",
           keys: ["⌘ Command", "Right-click"], spokenKeys: "Command right-click"),
     Slide(symbol: "computermouse.fill", color: rgb(0.6, 0.35, 0.95), title: "Move and change speed",
           body: "While Reader+ is reading, hold Command and press the Back button on the side of your mouse to go to the previous paragraph, or Forward for the next one.\n\nHold Command and scroll up to read faster, or down to read slower.",
@@ -1268,7 +1309,7 @@ let slides: [Slide] = [
     Slide(symbol: "slider.horizontal.3", color: rgb(0.95, 0.75, 0.1), title: "Everything else",
           body: "Mouse Echo reads what the pointer rests on. Key Echo says what you type. The reading window shows big, high-contrast text with each word highlighted.\n\nYou turn these on in the Reader+ window or from the Reader+ icon in the menu bar, not with keys. If you ever want lots of keyboard commands, that's what VoiceOver is for."),
     Slide(symbol: "checkmark.seal.fill", color: rgb(0.2, 0.7, 0.35), title: "You're ready",
-          body: "Remember three things. Command-click to read. Command right-click to read the whole page. Tap Control to stop.\n\nYou can take this tour again from the Reader+ window, under General."),
+          body: "Remember three things. Command-click to read from there on. Command right-click to stop, or to read the whole page when nothing is playing. Tapping Control stops it too.\n\nYou can take this tour again from the Reader+ window, under General."),
 ]
 
 final class TourController: NSObject, NSWindowDelegate {
@@ -1557,6 +1598,11 @@ final class PreviousApp {
                a.processIdentifier != ProcessInfo.processInfo.processIdentifier { self.app = a }
         }
         if let f = NSWorkspace.shared.frontmostApplication, f.processIdentifier != ProcessInfo.processInfo.processIdentifier { app = f }
+        // Ask every app you switch to for its full text (Electron/Chromium apps hide it until asked).
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { n in
+            if let a = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication { exposeText(a.processIdentifier) }
+        }
+        for a in NSWorkspace.shared.runningApplications where a.activationPolicy == .regular { exposeText(a.processIdentifier) }
     }
     /// Switch back to the app you were using, then do something there.
     func run(_ action: @escaping () -> Void) {
@@ -1646,7 +1692,7 @@ struct KeysText: View {
 let shortcutList: [(String, String)] = [
     ("Read a heading, paragraph, post or picture", "⌘-click"),
     ("Read the whole page or window", "⌘-right-click"),
-    ("Pause or resume", "⌘-right-click while reading"),
+    ("Stop talking", "⌘-right-click while reading"),
     ("Previous / next paragraph", "⌘ + mouse Back / Forward"),
     ("Faster / slower", "⌘ + scroll up / down"),
     ("Stop talking", "Tap ⌃ Control"),
@@ -1746,7 +1792,7 @@ struct ReadingPane: View {
                     Spacer()
                 }
                 LabeledContent("Stop at any time") { KeysText(keys: "Tap ⌃ Control") }
-                LabeledContent("Pause or resume") { KeysText(keys: "⌘-right-click") }
+                LabeledContent("Or") { KeysText(keys: "⌘-right-click") }
                 LabeledContent("Faster / slower") { KeysText(keys: "⌘ + scroll") }
             }
         }
@@ -1769,7 +1815,7 @@ struct ClickPane: View {
                 .pickerStyle(.radioGroup)
                 Toggle("Open the reading window when I click", isOn: model.bool(Key.clickShowsReader))
             } footer: {
-                Text("Command right-click reads the whole page or window, and pauses or resumes while Reader+ is talking. While reading, hold Command and use your mouse's Back and Forward buttons to move by paragraph, or the scroll wheel to change the speed. Clicking a heading reads the heading and everything under it, up to the next heading of the same level. On Facebook, Instagram, X and other social sites, clicking a post opens See more and reads the whole post. Clicking a picture reads the words in it. Clicks read aloud without opening the reading window unless you turn it on above. Command-clicking a link still opens it normally.")
+                Text("Command right-click reads the whole page or window, and stops Reader+ while it's talking. While reading, hold Command and use your mouse's Back and Forward buttons to move by paragraph, or the scroll wheel to change the speed. Clicking a heading reads the heading and everything under it, up to the next heading of the same level. On Facebook, Instagram, X and other social sites, clicking a post opens See more and reads the whole post. Clicking a picture reads the words in it. Clicks read aloud without opening the reading window unless you turn it on above. Command-clicking a link still opens it normally.")
                     .foregroundStyle(.secondary)
             }
         }
@@ -1978,7 +2024,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     Reader plus works with the mouse while you hold the Command key. \
     Command-click a heading to hear it and everything under it. Command-click a paragraph to hear the article from there. \
     Command-click a social media post to hear the whole post, or a picture to hear the words in it. \
-    Command right-click to hear the whole page or window. While Reader plus is talking, Command right-click pauses and resumes. \
+    Command right-click to hear the whole page or window. While Reader plus is talking, Command right-click stops it. \
     Hold Command and press the Back or Forward button on the side of your mouse to go to the previous or next paragraph. \
     Hold Command and scroll up to read faster, or down to read slower. \
     Tap the Control key by itself to stop talking. \
