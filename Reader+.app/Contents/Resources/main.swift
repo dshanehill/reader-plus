@@ -75,23 +75,36 @@ extension String { var trimmed: String { trimmingCharacters(in: .whitespacesAndN
 
 // MARK: - Speech (system voices — the same ones VoiceOver uses)
 
-final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
+/// Speaks with either a voice picked in Reader+ (AVSpeechSynthesizer), or the Mac's System Voice
+/// from System Settings > Accessibility > Spoken Content, which can be a Siri voice (NSSpeechSynthesizer).
+final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerDelegate {
     static let shared = Speaker()
     let synth = AVSpeechSynthesizer()
+    private var sys = NSSpeechSynthesizer()
     private var offsets: [ObjectIdentifier: Int] = [:]   // where each piece starts in the full text
     private var lastPiece: AVSpeechUtterance?
+    private var sysQueue: [(Int, String)] = []
+    private var sysOffset = 0
+    private var sysReading = false
+    private var sysPaused = false
     var onWord: ((NSRange) -> Void)?
     var onDone: (() -> Void)?
 
-    override init() { super.init(); synth.delegate = self }
+    override init() { super.init(); synth.delegate = self; sys.delegate = self }
 
-    var isReading: Bool { lastPiece != nil }
-    var isPaused: Bool { synth.isPaused }
+    /// "Siri / System Voice" is chosen (no Reader+ voice picked).
+    var useSystemVoice: Bool { (prefs.string(forKey: Key.voice) ?? "").isEmpty }
+    var isReading: Bool { lastPiece != nil || sysReading }
+    var isPaused: Bool { synth.isPaused || sysPaused }
+    var isSpeaking: Bool { synth.isSpeaking || sys.isSpeaking }
 
     var voice: AVSpeechSynthesisVoice? {
         if let id = prefs.string(forKey: Key.voice), let v = AVSpeechSynthesisVoice(identifier: id) { return v }
         return AVSpeechSynthesisVoice(language: AVSpeechSynthesisVoice.currentLanguageCode())
     }
+
+    /// Reader+'s speed (0.1–1.0, 0.5 is normal) in words per minute, for the System Voice.
+    var wordsPerMinute: Float { Float(max(90, min(520, 185 * prefs.double(forKey: Key.rate) / 0.5))) }
 
     /// Splits text into pieces of about a paragraph (long paragraphs at sentence ends).
     static func pieces(_ text: String) -> [(Int, String)] {
@@ -113,15 +126,32 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
         return out
     }
 
+    private func halt() {
+        offsets = [:]; lastPiece = nil
+        sysQueue = []; sysReading = false; sysPaused = false
+        if synth.isSpeaking || synth.isPaused { synth.stopSpeaking(at: .immediate) }
+        if sys.isSpeaking { sys.stopSpeaking() }
+    }
+
     /// Speak text. `track` = this is a reading (word highlighting, reading window).
     func say(_ text: String, track: Bool = false) {
         guard !text.trimmed.isEmpty else { return }
-        let wasReading = lastPiece != nil
-        offsets = [:]; lastPiece = nil
-        if synth.isSpeaking || synth.isPaused { synth.stopSpeaking(at: .immediate) }
+        let wasReading = isReading
+        halt()
+        if !track && wasReading { onDone?() }
+        if useSystemVoice {
+            let s = NSSpeechSynthesizer()   // a fresh one, so a newly chosen System Voice is used
+            s.delegate = self
+            s.rate = wordsPerMinute
+            sys = s
+            if !track { s.startSpeaking(text.trimmed); return }
+            sysQueue = Speaker.pieces(text)
+            sysReading = true
+            nextSystemPiece()
+            return
+        }
         let rate = Float(prefs.double(forKey: Key.rate)), v = voice
         if !track {
-            if wasReading { onDone?() }
             let u = AVSpeechUtterance(string: text.trimmed); u.rate = rate; u.voice = v
             synth.speak(u); return
         }
@@ -133,18 +163,45 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate {
         }
     }
 
+    private func nextSystemPiece() {
+        guard sysReading else { return }
+        guard !sysQueue.isEmpty else { sysReading = false; onDone?(); return }
+        let (off, text) = sysQueue.removeFirst()
+        sysOffset = off
+        if !sys.startSpeaking(text) { sysReading = false; onDone?() }
+    }
+
     func pauseOrResume() {
+        if sysReading || sys.isSpeaking || sysPaused {
+            if sysPaused { sys.continueSpeaking(); sysPaused = false }
+            else { sys.pauseSpeaking(at: .wordBoundary); sysPaused = true }
+            return
+        }
         if synth.isPaused { synth.continueSpeaking() }
         else if synth.isSpeaking { synth.pauseSpeaking(at: .word) }
     }
 
     func stop() {
-        let wasReading = lastPiece != nil
-        offsets = [:]; lastPiece = nil
-        if synth.isSpeaking || synth.isPaused { synth.stopSpeaking(at: .immediate) }
+        let wasReading = isReading
+        halt()
         if wasReading { onDone?() }
     }
 
+    // System Voice (Siri) callbacks
+    func speechSynthesizer(_ sender: NSSpeechSynthesizer, willSpeakWord characterRange: NSRange, of string: String) {
+        DispatchQueue.main.async {
+            guard sender === self.sys, self.sysReading else { return }
+            self.onWord?(NSRange(location: characterRange.location + self.sysOffset, length: characterRange.length))
+        }
+    }
+    func speechSynthesizer(_ sender: NSSpeechSynthesizer, didFinishSpeaking finishedSpeaking: Bool) {
+        DispatchQueue.main.async {
+            guard sender === self.sys, self.sysReading else { return }
+            self.nextSystemPiece()
+        }
+    }
+
+    // Reader+ voice callbacks
     func speechSynthesizer(_ s: AVSpeechSynthesizer, willSpeakRangeOfSpeechString r: NSRange, utterance u: AVSpeechUtterance) {
         let id = ObjectIdentifier(u)
         DispatchQueue.main.async {
@@ -1334,7 +1391,7 @@ let clickTapCallback: CGEventTapCallBack = { _, type, event, _ in
     // ⌘-right-click: stop while talking, otherwise read the whole page or window.
     if type == .rightMouseDown, ClickReader.modifiersMatch(event.flags) {
         let p = event.location
-        if talking || Speaker.shared.synth.isSpeaking {
+        if talking || Speaker.shared.isSpeaking {
             cr.swallowRightUp = true
             DispatchQueue.main.async {
                 Speaker.shared.stop()
@@ -2005,7 +2062,7 @@ struct VoicePane: View {
                         model.changed()
                         if Speaker.shared.isReading { Reading.shared.restartHere() } else { say("This is my voice.") }
                     })) {
-                    Text("System Voice").tag("")
+                    Text("Siri / System Voice").tag("")
                     Divider()
                     ForEach(readingVoices(), id: \.identifier) { v in Text(title(v)).tag(v.identifier) }
                 }
@@ -2026,10 +2083,10 @@ struct VoicePane: View {
                 HStack {
                     Spacer()
                     Button("Test Voice") { say("Hello. This is how Reader plus sounds.") }
-                    Button("Get More Voices…") { appDel.moreVoices() }
+                    Button("Choose Siri Voice…") { appDel.moreVoices() }
                 }
             } footer: {
-                Text("Reader+ uses the same voices as VoiceOver. Enhanced and Premium voices sound the most natural.")
+                Text("Siri / System Voice speaks with the voice chosen in System Settings, Accessibility, Spoken Content. Pick a Siri voice there and Reader+ uses it. The other voices are the ones VoiceOver uses; Enhanced and Premium sound the most natural.")
                     .foregroundStyle(.secondary)
             }
         }
@@ -2375,7 +2432,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let vm = NSMenu()
         let current = prefs.string(forKey: Key.voice)
         let voices = readingVoices()
-        let sys = NSMenuItem(title: "System Voice (Spoken Content)", action: #selector(pickVoice(_:)), keyEquivalent: "")
+        let sys = NSMenuItem(title: "Siri / System Voice", action: #selector(pickVoice(_:)), keyEquivalent: "")
         sys.target = self; sys.representedObject = ""; sys.state = current == nil ? .on : .off
         vm.addItem(sys); vm.addItem(.separator())
         for v in voices {
@@ -2424,7 +2481,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if Speaker.shared.isReading { Reading.shared.restartHere() } else { say("This is my voice.") }
     }
     @objc func moreVoices() {
-        say("To add voices, choose Manage Voices under System Voice. Enhanced and Premium voices sound the most natural.")
+        say("To use Siri, open System Voice here and pick a Siri voice. Reader plus uses it when Siri, System Voice is chosen. Manage Voices adds more.")
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.universalaccess?SpokenContent")!)
     }
     @objc func faster() { Reading.shared.changeRate(0.05) }
