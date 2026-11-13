@@ -85,3 +85,62 @@ Found a site where Reader+ doesn't read correctly, or have an idea? Please [open
 ## License
 
 [MIT](LICENSE). Free to use, share and change.
+
+## Automatically read AI answers
+
+AI answer reading is **on by default**, including for existing installations. In
+**General → AI Answers**, you can turn it off, choose a 2/4/6 second completion
+settling delay, stop the previous automatic reading when another answer starts,
+and choose whether automatic readings open the reading window. The menu bar also
+has an **Automatically Read AI Answers** switch. Voice and speed use the existing
+Reader+ controls. The status in General explains whether a readable chat is found.
+
+The initial adapters support English accessibility layouts on **ChatGPT
+(chatgpt.com and chat.openai.com), Claude (claude.ai), and Gemini
+(gemini.google.com)** in a foreground browser. They use macOS Accessibility;
+there is no browser extension, JavaScript permission, or account setup. The
+existing Accessibility permission is required. Only the active application's
+focused web window is inspected; this is not background-tab monitoring.
+
+Reader+ watches for an exposed generation indicator or a newly appended assistant
+turn after its baseline, isolates the newest assistant turn, waits for generation
+to end and a Copy control within that turn, then waits
+for the text to settle. A quiet stream alone never counts as completion. Opening
+an existing chat or enabling the feature establishes a baseline without reading
+history. Prompt text, editable composers and action labels are excluded. Repeated
+polls do not repeat playback. Tap Control or use Stop to cancel; a stopped or
+manually superseded answer is not retried. Manual readings and paused speech take
+priority: automatic answers that finish while the speaker is occupied are skipped,
+not queued. New generation can stop only speech owned by auto-read, according to
+the interruption setting. Switching to another app stops its automatic reading;
+opening Reader+'s own controls preserves playback so Pause/Resume still work.
+
+Limitations:
+
+- Polling runs about every 0.75 s, with one bounded background scan at a time.
+  A newly appended completed assistant turn can be detected even when its stream
+  was too fast to observe. An entire prompt-and-answer cycle between polls, answers generated
+  while the browser is in the background, and pages opened only after completion
+  may be skipped. There is no timeout-based partial-reading fallback.
+- English assistant headings and accessible Copy/generation controls must be
+  exposed. Other languages, native desktop AI apps, Copilot, Perplexity, Grok,
+  embedded side panels and alternate layouts are not validated or supported yet.
+- Long or inaccessible trees are skipped after a bounded scan. Three unavailable
+  scans reset the baseline. No OCR or whole-page fallback is used for auto-read.
+- Recognizable stopped/error indicators suppress playback. A site's own Stop
+  button can still produce a readable partial answer if the site exposes it
+  exactly like a completed answer without a cancellation indicator.
+- Text is passed to the selected voice engine. Apple/Kokoro stay local; choosing
+  an ElevenLabs voice sends the answer to ElevenLabs under the existing settings.
+  Auto-read logs status and character counts, not prompts or answer text.
+
+Validation for this change: actual Chrome accessibility layouts were inspected
+while generating and after completion on ChatGPT, Claude and Gemini; the installed
+native app recognized completed assistant content and exposed the new settings.
+Automated fixtures exercise the actual extraction and completion state code.
+Existing native speech/pipeline/OCR regressions pass. **Full live automatic audio
+playback on those sites has not been verified end to end**; do not interpret the
+layout checks as a playback certification.
+
+Run `python3 tests/run_auto_read.py` for the non-speaking AI regression tests, and
+`python3 tests/run_regressions.py` for the existing Mac reading/speech checks.

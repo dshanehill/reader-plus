@@ -1,5 +1,17 @@
 # Changes
 
+## 2026-11-13 — Automatic AI answer reading
+
+- Enabled-by-default foreground AI monitoring for English ChatGPT, Claude and
+  Gemini accessibility layouts, using the existing voice engine and permissions.
+- Assistant-only extraction, explicit generation/completion controls, settling
+  delay, history baseline, duplicate suppression and cancellation/manual priority.
+- Accessible General settings and menu switch, completion delay, interruption
+  policy, optional reading window, and monitoring status.
+- Added AI state/extraction regression fixtures; documented exact coverage and
+  limitations, including the lack of a completed live audio end-to-end check.
+
+
 ## Unreleased — responsiveness fixes (2026-11-13)
 
 ### Follow-up audit and reproducible regressions

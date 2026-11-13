@@ -22,3 +22,19 @@ Coverage includes:
 - Actual system and installed Apple speech, rapid replacement, stopping before speech starts, reading after Stop, pause/resume, paragraph offsets, and leading whitespace.
 
 These fixtures do not establish physical Command-click behavior on every website, actual Finder/Dock selection, screen-capture permission flows, or optional ElevenLabs service behavior. Those boundaries require separate end-to-end checks before making broader release claims.
+
+AI auto-read checks run separately without speaking:
+
+```sh
+python3 tests/run_auto_read.py
+```
+
+This compiles the actual `AIChatSnapshot`, `AIAutoReadState`, and `AINode` source
+with deterministic fixtures modeled on the inspected English Chrome layouts.
+It covers partial streams and long pauses, explicit completion and settling,
+fast appended replies, duplicate suppression, Stop and subsequent answers,
+missing completion controls, history baselines, local-to-server ChatGPT URL
+resolution, navigation with identical prompts, and assistant extraction from a
+parent containing both prompts and answers on ChatGPT, Claude and Gemini.
+It does not substitute for a live automatic playback test or certify other sites,
+languages, browser accessibility transports, or cancellation signals from a site.

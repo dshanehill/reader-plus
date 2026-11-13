@@ -37,6 +37,7 @@ func log(_ s: String) {
 }
 
 enum Key {
+    static let aiAutoRead = "aiAutoRead", aiDelay = "aiDelay", aiInterrupt = "aiInterrupt", aiShowWindow = "aiShowWindow"
     static let voice = "voice", rate = "rate", mouseEcho = "mouseEcho", hoverDelay = "hoverDelay"
     static let keyEcho = "keyEcho", fontSize = "fontSize", theme = "theme"
     static let screenHighlight = "screenHighlight", showReader = "showReader"
@@ -45,6 +46,7 @@ enum Key {
 let prefs = UserDefaults.standard
 func registerDefaults() {
     prefs.register(defaults: [
+        Key.aiAutoRead: true, Key.aiDelay: 2.0, Key.aiInterrupt: true, Key.aiShowWindow: false,
         Key.rate: 0.5, Key.mouseEcho: false, Key.hoverDelay: 0.45, Key.keyEcho: 0,
         Key.fontSize: 34.0, Key.theme: 0, Key.screenHighlight: true, Key.showReader: true,
         Key.clickMode: 1,      // 0 off, 1 ⌘-click, 2 ⌥⌘-click
@@ -829,7 +831,8 @@ final class Speaker: NSObject, AVSpeechSynthesizerDelegate, NSSpeechSynthesizerD
         else if synth.isSpeaking { synth.pauseSpeaking(at: .word) }
     }
 
-    func stop() {
+    func stop(autoReadStop: Bool = false) {
+        if !autoReadStop { AIAutoReader.shared.suppressPending() }
         ClickReader.shared.cancelPending()
         request?.trace("stopped"); request = nil
         ReaderModel.shared.activity = "Stopped"
@@ -1749,7 +1752,8 @@ final class Reading {
         }
     }
 
-    func start(_ src: ReadSource, from: Int = 0, showWindow: Bool = true, request: ReadRequest? = nil) {
+    func start(_ src: ReadSource, from: Int = 0, showWindow: Bool = true, request: ReadRequest? = nil, autoRead: Bool = false) {
+        if !autoRead { AIAutoReader.shared.suppressPending() }
         ClickReader.shared.cancelPending()
         generation += 1
         Speaker.shared.request = request
@@ -2825,6 +2829,7 @@ final class ReaderModel: ObservableObject {
     static let shared = ReaderModel()
     @Published var tick = 0
     @Published var activity = "Ready"
+    @Published var aiStatus = "Waiting for a supported AI web chat"
     private var timer: Timer?
     func startTicking() {
         guard timer == nil else { return }
@@ -2957,6 +2962,20 @@ struct GeneralPane: View {
                     set: { _ in appDel.toggleLogin(); model.changed() }))
                 LabeledContent("Guided tour") { Button("Take the Tour…") { TourController.shared.show() } }
                 LabeledContent("Spoken help") { Button("Play") { appDel.help() } }
+            }
+            Section("AI Answers") {
+                Toggle("Automatically read completed AI answers", isOn: model.bool(Key.aiAutoRead))
+                    .onChange(of: prefs.bool(forKey: Key.aiAutoRead)) { _ in AIAutoReader.shared.reset() }
+                Toggle("Stop the previous AI reading when a new answer starts", isOn: model.bool(Key.aiInterrupt))
+                Toggle("Show the reading window for AI answers", isOn: model.bool(Key.aiShowWindow))
+                Picker("Wait after completion", selection: Binding(get: { prefs.double(forKey: Key.aiDelay) }, set: { prefs.set($0, forKey: Key.aiDelay); model.changed() })) {
+                    Text("2 seconds").tag(2.0)
+                    Text("4 seconds").tag(4.0)
+                    Text("6 seconds").tag(6.0)
+                }
+                Text(model.aiStatus).accessibilityLabel("AI reading status: " + model.aiStatus)
+                Text("Reads new answers in the active supported AI web chat. Requires exposed assistant labels, a generation indicator and a completed response control. Existing chats are not read on opening. Uses your selected voice and speed, including any selected online voice service. Tap Control to stop; use the reading controls to pause.")
+                    .font(.callout).foregroundStyle(.secondary)
             }
             Section {
                 ForEach(shortcutList.indices, id: \.self) { i in
@@ -3309,6 +3328,244 @@ final class ControlWindow: NSObject, NSWindowDelegate {
     }
 }
 
+// MARK: - AI auto-read state (also exercised by tests/auto_read.swift)
+
+struct AIChatSnapshot {
+    let conversation: String
+    let responseID: String
+    let text: String
+    let generating: Bool
+    let complete: Bool
+    var page: String = ""
+}
+
+/// Completion is an explicit site signal plus a settling interval, never silence alone.
+struct AIAutoReadState {
+    var conversation = ""
+    var page = ""
+    var baseline = ""
+    var baselineResponseID = ""
+    var candidate = ""
+    var changedAt = 0.0
+    var armed = false
+    var suppressed = false
+    mutating func suppress() { suppressed = true; armed = false }
+    var consumed = Set<String>()
+    mutating func observe(_ s: AIChatSnapshot, now: Double, delay: Double) -> String? {
+        let signature = s.responseID + "\n" + s.text
+        let localURLResolved = page.contains("/c/local-chatgpt") && s.page.hasPrefix("/c/")
+        if conversation != s.conversation || (page != s.page && !localURLResolved) {
+            page = s.page; suppressed = false
+            conversation = s.conversation; baseline = signature; baselineResponseID = s.responseID; candidate = signature
+            changedAt = now; armed = s.generating
+            return nil // Never read history on launch or tab navigation.
+        }
+        page = s.page
+        if suppressed {
+            if !s.generating { suppressed = false; baseline = signature; baselineResponseID = s.responseID; candidate = signature; changedAt = now }
+            return nil
+        }
+        if s.generating { armed = true; changedAt = now; candidate = signature; return nil }
+        if s.complete && !s.text.isEmpty && s.responseID != baselineResponseID { armed = true }
+        if candidate != signature { candidate = signature; changedAt = now; return nil }
+        guard armed, s.complete, !s.text.isEmpty, signature != baseline,
+              now - changedAt >= delay else { return nil }
+        armed = false; baseline = signature; baselineResponseID = s.responseID
+        // Consume before delivery: Stop, manual reading and speech failure never cause retries.
+        guard consumed.insert(conversation + "\n" + signature).inserted else { return nil }
+        if consumed.count > 256 { consumed = [conversation + "\n" + signature] }
+        return s.text
+    }
+}
+
+// MARK: - AI accessibility adapter
+
+struct AINode {
+    var role: String
+    var label: String
+    var identifier: String
+    var text: String
+    var children: [AINode]
+    var isButton: Bool { role == "AXButton" }
+    var stop: Bool {
+        isButton && ["stop", "stop generating", "stop response", "stop responding", "stop streaming"].contains(label.lowercased())
+    }
+    var copy: Bool {
+        isButton && ["copy", "copy response", "copy message", "copy answer"].contains(label.lowercased())
+    }
+    func contains(_ predicate: (AINode) -> Bool) -> Bool {
+        predicate(self) || children.contains { $0.contains(predicate) }
+    }
+    var spokenText: String {
+        // Never include editable fields, button labels, prompts, or page chrome.
+        if ["AXTextArea", "AXTextField", "AXButton", "AXToolbar"].contains(role) { return "" }
+        if role == "AXStaticText" { return ["ChatGPT said:", "Claude said:", "Gemini said:"].contains(text) ? "" : text }
+        return children.map(\.spokenText).filter { !$0.isEmpty }.joined(separator: "\n")
+    }
+    var assistant: Bool {
+        label.lowercased().hasPrefix("claude responded:")
+            || ["chatgpt said:", "claude said:", "gemini said:", "gemini said", "assistant response", "assistant message"].contains(label.lowercased())
+    }
+    func responses() -> [AINode] {
+        var result: [AINode] = []
+        var index = 0
+        while index < children.count {
+            let child = children[index]
+            if child.role == "AXHeading" && child.assistant {
+                // AX can flatten user and assistant turns into the same parent.
+                // Slice AFTER the assistant heading, never collect that entire parent.
+                let start = index + 1
+                var end = start
+                while end < children.count {
+                    let next = children[end]
+                    if next.role == "AXHeading" && (next.assistant || next.label.lowercased().hasPrefix("you said") || next.label == "Latest response") { break }
+                    end += 1
+                }
+                result.append(AINode(role: "AXGroup", label: "Assistant response", identifier: identifier,
+                                     text: "", children: Array(children[start..<end])))
+                index = end
+            } else {
+                result += child.responses(); index += 1
+            }
+        }
+        if !result.isEmpty { return result }
+        return assistant ? [self] : []
+    }
+
+}
+
+final class AIAutoReader {
+    static let shared = AIAutoReader()
+    private var timer: Timer?
+    private var working = false
+    private var failure = ""
+    private var misses = 0
+    private var state = AIAutoReadState()
+    private var epoch = 0
+    private var observedPID: pid_t?
+    private var ownedGeneration: Int?
+
+    func start() {
+        timer = Timer.scheduledTimer(withTimeInterval: 0.75, repeats: true) { [weak self] _ in self?.poll() }
+    }
+    func reset() {
+        epoch += 1; state = AIAutoReadState()
+        stopOwned()
+    }
+    func suppressPending() { state.suppress() }
+    private func stopOwned() {
+        if let g = ownedGeneration, g == Reading.shared.generation { Speaker.shared.stop(autoReadStop: true) }
+        ownedGeneration = nil
+    }
+    private func poll() {
+        guard prefs.bool(forKey: Key.aiAutoRead), AXIsProcessTrusted(),
+              let front = NSWorkspace.shared.frontmostApplication else { reset(); return }
+        guard front.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
+        if observedPID != front.processIdentifier { reset(); observedPID = front.processIdentifier }
+        guard !working else { return }
+        working = true
+        let pid = front.processIdentifier, token = epoch
+        let readingGeneration = Reading.shared.generation
+        exposeText(pid)
+        DispatchQueue.global(qos: .utility).async {
+            let snapshot: AIChatSnapshot? = AXWork.run(seconds: 1.5) {
+                self.snapshot(pid)
+            }
+            DispatchQueue.main.async {
+                self.working = false
+                guard token == self.epoch, prefs.bool(forKey: Key.aiAutoRead),
+                      NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
+                guard let s = snapshot else {
+                    self.misses += 1
+                    ReaderModel.shared.aiStatus = "No readable supported AI chat in the active window"
+                    if self.misses >= 3 { self.reset() }
+                    return
+                }
+                self.misses = 0
+                let status = s.generating ? "AI answer is generating" : (s.text.isEmpty ? "Waiting for a recognizable assistant answer" : "Watching for a new completed AI answer")
+                if ReaderModel.shared.aiStatus != status { log("AI auto-read: " + status) }
+                ReaderModel.shared.aiStatus = status
+                if s.generating && prefs.bool(forKey: Key.aiInterrupt) { self.stopOwned() }
+                guard let text = self.state.observe(s, now: ProcessInfo.processInfo.systemUptime,
+                                                   delay: prefs.double(forKey: Key.aiDelay)) else { return }
+                guard readingGeneration == Reading.shared.generation,
+                      !Speaker.shared.isReading, !Speaker.shared.isSpeaking, !Speaker.shared.isPaused,
+                      !ClickReader.shared.hasPending else { return }
+                Reading.shared.start(ReadSource(text: text, element: nil, base: 0),
+                                     showWindow: prefs.bool(forKey: Key.aiShowWindow), autoRead: true)
+                self.ownedGeneration = Reading.shared.generation
+                log("AI auto-read: started completed answer (\(text.count) characters)")
+            }
+        }
+    }
+    private func snapshot(_ pid: pid_t) -> AIChatSnapshot? {
+        func unavailable(_ reason: String) -> AIChatSnapshot? {
+            if failure != reason { failure = reason; log("AI auto-read unavailable: " + reason) }
+            return nil
+        }
+        let app = AXUIElementCreateApplication(pid)
+        guard let window = axElement(app, "AXFocusedWindow") else { return unavailable("no focused window") }
+        var count = 0
+        var truncated = false
+        func read(_ e: AXUIElement, depth: Int) -> AINode? {
+            guard depth < 75, count < 10000, AXWork.current?.expired != true else { truncated = true; return nil }
+            count += 1
+            let role = axString(e, "AXRole") ?? ""
+            if role == "AXStaticText" {
+                return AINode(role: role, label: "", identifier: "", text: axString(e, "AXValue") ?? "", children: [])
+            }
+            if ["AXTextArea", "AXTextField", "AXComboBox"].contains(role) {
+                return AINode(role: role, label: "", identifier: "", text: "", children: [])
+            }
+            let label = axString(e, "AXDescription") ?? ""
+            let title = label.isEmpty && ["AXButton", "AXHeading"].contains(role) ? (axString(e, "AXTitle") ?? "") : label
+            let children = axChildren(e).compactMap { read($0, depth: depth + 1) }
+            let name = title.isEmpty && role == "AXHeading" ? children.map(\.spokenText).joined(separator: " ") : title
+            return AINode(role: role, label: name, identifier: "", text: "", children: children)
+        }
+        // Scope to one web area, and verify the host rather than trusting a window title.
+        func web(_ e: AXUIElement, depth: Int) -> AXUIElement? {
+            guard depth < 15, AXWork.current?.expired != true else { return nil }
+            if axString(e, "AXRole") == "AXWebArea" { return e }
+            for c in axChildren(e) { if let found = web(c, depth: depth + 1) { return found } }
+            return nil
+        }
+        guard let area = web(window, depth: 0) else { return unavailable("no accessible web area") }
+        guard let rawURL = ax(area, "AXURL") else { return unavailable("web area has no URL") }
+        guard let url = (rawURL as? URL) ?? (rawURL as? String).flatMap(URL.init(string:)),
+              let host = url.host?.lowercased() else { return unavailable("unreadable web URL") }
+        guard ["chatgpt.com", "chat.openai.com", "claude.ai", "gemini.google.com"].contains(host) else { return unavailable("active page is not a supported AI host") }
+        guard let tree = read(area, depth: 0), AXWork.current?.expired != true, count < 10000, !truncated else { return unavailable("accessibility scan exceeded budget") }
+        failure = ""
+        let responses = tree.responses()
+        let response = responses.last
+        let generating = tree.contains { $0.stop || $0.label == "Currently streaming message" || $0.text == "Claude is responding" }
+        let interrupted = tree.contains {
+            ["response stopped", "stopped generating", "you stopped this response", "response interrupted", "something went wrong"].contains($0.text.lowercased())
+        }
+        // Even an empty stream can arm detection; history alone cannot.
+        func prompts(_ n: AINode) -> [String] {
+            var result: [String] = []
+            for (index, child) in n.children.enumerated() {
+                if child.role == "AXHeading" && child.label.lowercased().hasPrefix("you said") {
+                    var prompt = child.label
+                    if index + 1 < n.children.count, n.children[index + 1].role == "AXStaticText" {
+                        prompt += "\n" + n.children[index + 1].text
+                    }
+                    result.append(prompt)
+                } else { result += prompts(child) }
+            }
+            return result
+        }
+        // New chats may replace a local URL with a server URL during the same stream.
+        // The exposed prompt sequence stays stable through that transition.
+        let turnContext = prompts(tree).joined(separator: "\n")
+        return AIChatSnapshot(conversation: "\(pid):\(host):\(turnContext)",
+                              responseID: "\(responses.count):\(response?.identifier ?? "")", text: response?.spokenText ?? "",
+                              generating: generating, complete: !interrupted && (response?.contains { $0.copy } ?? false), page: url.path)
+    }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -3322,6 +3579,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     Hold Command and press the Back or Forward button on the side of your mouse to go to the previous or next paragraph. \
     Hold Command and scroll up to read faster, or down to read slower. \
     Tap the Control key by itself to stop talking. \
+    New completed AI answers in supported web chats are read automatically. Change this under General, AI Answers. \
     Everything else, like Mouse Echo, Key Echo and the reading window, is in the Reader plus window and the menu bar icon.
     """
 
@@ -3332,6 +3590,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = PreviousApp.shared
         buildMenu()
         buildMainMenu()
+        AIAutoReader.shared.start()
         ClickReader.shared.start()
         if (prefs.string(forKey: Key.voice) ?? "").hasPrefix(Kokoro.prefix) { Kokoro.shared.warmUp() }
         MouseEcho.shared.apply()
@@ -3516,6 +3775,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = item(Speaker.shared.isPaused ? "Resume" : "Pause", #selector(pauseResume))
         _ = item("Stop Talking (tap Control)", #selector(stopSpeech))
         m.addItem(.separator())
+        _ = item("Automatically Read AI Answers", #selector(toggleAIRead), on: prefs.bool(forKey: Key.aiAutoRead))
         _ = item("Mouse Echo", #selector(toggleMouseEcho), on: prefs.bool(forKey: Key.mouseEcho))
         let keyItem = item("Key Echo", nil)
         let km = NSMenu()
@@ -3617,6 +3877,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleScreenHL() {
         let on = !prefs.bool(forKey: Key.screenHighlight); prefs.set(on, forKey: Key.screenHighlight)
         if !on { Overlay.shared.hide() }
+    }
+    @objc func toggleAIRead() {
+        prefs.set(!prefs.bool(forKey: Key.aiAutoRead), forKey: Key.aiAutoRead)
+        AIAutoReader.shared.reset(); ReaderModel.shared.changed()
+        say(prefs.bool(forKey: Key.aiAutoRead) ? "AI answer reading on" : "AI answer reading off")
     }
     @objc func toggleShowReader() { prefs.set(!prefs.bool(forKey: Key.showReader), forKey: Key.showReader) }
     @objc func pickVoice(_ s: NSMenuItem) {
